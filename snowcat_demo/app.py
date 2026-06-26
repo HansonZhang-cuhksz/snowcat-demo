@@ -596,6 +596,9 @@ with tab_mapping:
     st.latex(
         r"S_{\mathrm{buffer}} = b(M_0K_0 + K_0N_0 + M_0N_0)"
     )
+    st.latex(
+        r"T_{\mathrm{backing}} = b(MN_1K + M_1NK + MN)"
+    )
 
     a_tile, w_tile, b_tile = workload.tile_bytes(m0, k0, n0)
     footprint_df = pd.DataFrame(

@@ -1,0 +1,4 @@
+__pycache__/
+.agents/
+.pytest_cache/
+result/

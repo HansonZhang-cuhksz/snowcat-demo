@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
@@ -19,6 +21,8 @@ A_tensor = tensor_logic / logic_density * 10**6  # um^2/tensor
 tensor_flops = 512 * 1.00 * 10**9      # flops/s/tensor
 bw = 2.04 * 10**12                     # byte/s
 BYTE_PER_ELEMENT = 2
+CPU_WORKERS = 32
+PARALLEL_FRONTIER_MIN_GROUPS = CPU_WORKERS
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,15 @@ class GemmTaskGroup:
         return self.count * self.task.operations
 
 
+@dataclass(frozen=True)
+class TrafficFrontier:
+    label: str
+    count: int
+    operations: int
+    buffer_bytes: np.ndarray
+    traffic_bytes: np.ndarray
+
+
 # Edit this list to model a layer, block, or full sequence of GEMMs.
 GEMM_TASKS = [GemmTask("router", 8192, 256, 6144)] + [GemmTask("up_gate", 128, 4096, 6144)] * 512 + [GemmTask("down", 128, 6144, 2048)] * 512
 
@@ -65,47 +78,68 @@ def group_gemm_tasks(tasks: list[GemmTask]) -> list[GemmTaskGroup]:
     return task_groups
 
 
-def min_traffic_curve(task: GemmTask, capacities: np.ndarray) -> np.ndarray:
+def build_traffic_frontier(group: GemmTaskGroup) -> TrafficFrontier:
+    task = group.task
     workload = GemmWorkload(
         m=task.m,
         k=task.k,
         n=task.n,
         bytes_per_element=BYTE_PER_ELEMENT,
     )
-    points = sorted(enumerate_mappings(workload), key=lambda point: point.buffer_bytes)
+    pairs = sorted(
+        (point.buffer_bytes, point.backing_store_bytes)
+        for point in enumerate_mappings(workload)
+    )
+    buffers = np.fromiter((buffer for buffer, _ in pairs), dtype=np.int64)
+    traffic = np.fromiter((bytes_ for _, bytes_ in pairs), dtype=np.int64)
 
-    traffic = np.full(len(capacities), np.nan, dtype=float)
-    best: tuple[int, int] | None = None
-    point_index = 0
+    best_traffic = np.minimum.accumulate(traffic)
+    last_at_buffer = np.r_[buffers[1:] != buffers[:-1], True]
+    frontier_buffers = buffers[last_at_buffer]
+    frontier_traffic = best_traffic[last_at_buffer]
+    improved = np.r_[True, frontier_traffic[1:] < frontier_traffic[:-1]]
 
-    for capacity_index, capacity in enumerate(capacities):
-        while (
-            point_index < len(points)
-            and points[point_index].buffer_bytes <= capacity
-        ):
-            point = points[point_index]
-            candidate = (point.backing_store_bytes, point.buffer_bytes)
-            if best is None or candidate < best:
-                best = candidate
-            point_index += 1
-
-        if best is not None:
-            traffic[capacity_index] = best[0]
-
-    return traffic
+    return TrafficFrontier(
+        label=group.label,
+        count=group.count,
+        operations=group.task.operations,
+        buffer_bytes=frontier_buffers[improved],
+        traffic_bytes=frontier_traffic[improved],
+    )
 
 
-def execution_time_curve(
-    task: GemmTask, capacities: np.ndarray, compute_roof: np.ndarray
+def min_traffic_from_frontier(
+    frontier: TrafficFrontier, capacities: np.ndarray
 ) -> np.ndarray:
-    min_traffic = min_traffic_curve(task, capacities)
-    oi = task.operations / min_traffic
+    indexes = np.searchsorted(frontier.buffer_bytes, capacities, side="right") - 1
+    min_traffic = np.full(len(capacities), np.nan, dtype=float)
+    valid = indexes >= 0
+    min_traffic[valid] = frontier.traffic_bytes[indexes[valid]]
+    return min_traffic
+
+
+def execution_time_from_frontier(
+    frontier: TrafficFrontier, capacities: np.ndarray, compute_roof: np.ndarray
+) -> np.ndarray:
+    min_traffic = min_traffic_from_frontier(frontier, capacities)
+    oi = frontier.operations / min_traffic
     memory_roof = oi * bw
     peak = np.minimum(memory_roof, compute_roof)
 
     time_seconds = np.full(len(capacities), np.nan, dtype=float)
-    np.divide(task.operations, peak, out=time_seconds, where=peak > 0)
-    return time_seconds
+    np.divide(frontier.operations, peak, out=time_seconds, where=peak > 0)
+    return frontier.count * time_seconds
+
+
+def build_frontiers(task_groups: list[GemmTaskGroup]) -> tuple[list[TrafficFrontier], str]:
+    if len(task_groups) < PARALLEL_FRONTIER_MIN_GROUPS:
+        return [build_traffic_frontier(group) for group in task_groups], "serial"
+
+    with ProcessPoolExecutor(max_workers=CPU_WORKERS) as executor:
+        frontiers = list(
+            executor.map(build_traffic_frontier, task_groups, chunksize=1)
+        )
+    return frontiers, f"{CPU_WORKERS}-process"
 
 
 def write_csv(
@@ -151,8 +185,12 @@ def plot_results(
     task_times: dict[str, np.ndarray],
     total_time: np.ndarray,
 ) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    Path("result").mkdir(exist_ok=True)
     total_operations = sum(group.operations for group in task_groups)
     effective_flops = total_operations / total_time
 
@@ -211,10 +249,14 @@ def main() -> None:
     compute_roof = tensors * tensor_flops
 
     task_groups = group_gemm_tasks(GEMM_TASKS)
+    frontiers, frontier_mode = build_frontiers(task_groups)
     task_times = {
-        group.label: group.count
-        * execution_time_curve(group.task, sram_bytes, compute_roof)
-        for group in task_groups
+        frontier.label: execution_time_from_frontier(
+            frontier,
+            sram_bytes,
+            compute_roof,
+        )
+        for frontier in frontiers
     }
     total_time = np.sum(np.array(list(task_times.values())), axis=0)
 
@@ -232,6 +274,10 @@ def main() -> None:
     best_index = int(np.nanargmin(total_time))
     total_operations = sum(group.operations for group in task_groups)
     effective_flops = total_operations / total_time[best_index]
+    print(f"CPU workers available: {CPU_WORKERS}")
+    print(f"Frontier build mode: {frontier_mode}")
+    print(f"Unique GEMM groups: {len(task_groups)}")
+    print(f"Total traffic frontier points: {sum(len(frontier.buffer_bytes) for frontier in frontiers)}")
     print(f"Best r: {r[best_index]:.6g}")
     print(f"SRAM: {sram_bytes[best_index] / 2**20:.3f} MiB")
     print(f"Tensor Cores: {int(tensors[best_index])}")

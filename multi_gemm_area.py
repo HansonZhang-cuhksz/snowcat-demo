@@ -261,7 +261,7 @@ def main() -> None:
     total_time = np.sum(np.array(list(task_times.values())), axis=0)
 
     write_csv(
-        "multi_gemm_times.csv",
+        "./result/multi_gemm_times.csv",
         r,
         sram_bytes,
         tensors,

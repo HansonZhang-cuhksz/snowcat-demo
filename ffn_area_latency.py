@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
 
 import numpy as np
@@ -65,6 +66,13 @@ USE_REGISTER_ACCUMULATOR_MAPPINGS = True
 # where each expert's token count follows Binomial(BATCH_TOKENS, top_k/EXPERTS).
 USE_RANDOM_EXPERT_DISTRIBUTION = False
 EXPERT_DISTRIBUTION_PROBABILITY_CUTOFF = 1e-12
+
+# Pipeline-depth memory model.  The Snowcat tile buffer is treated as one
+# software-pipeline stage.  A mapping therefore consumes NUM_STAGES copies of
+# that one-stage tile footprint in SMEM, while the in-flight bytes available for
+# latency hiding scale with NUM_STAGES.
+PIPELINE_NUM_STAGES = 4
+HBM_LATENCY_CYCLES = 500
 
 
 @dataclass(frozen=True)
@@ -173,6 +181,7 @@ class TrafficFrontier:
     operations: int
     buffer_bytes: np.ndarray
     traffic_bytes: np.ndarray
+    stage_bytes: np.ndarray
 
 
 GEMM_TASKS = [
@@ -293,17 +302,46 @@ def build_traffic_frontier(group: GemmTaskGroup) -> TrafficFrontier:
         else enumerate_mappings(workload)
     )
     pairs = sorted(
-        (point.buffer_bytes, point.backing_store_bytes)
+        (
+            point.buffer_bytes * PIPELINE_NUM_STAGES,
+            point.backing_store_bytes,
+            point.buffer_bytes,
+        )
         for point in mapping_points
     )
-    buffers = np.fromiter((buffer for buffer, _ in pairs), dtype=np.int64)
-    traffic = np.fromiter((bytes_ for _, bytes_ in pairs), dtype=np.int64)
 
-    best_traffic = np.minimum.accumulate(traffic)
-    last_at_buffer = np.r_[buffers[1:] != buffers[:-1], True]
-    frontier_buffers = buffers[last_at_buffer]
-    frontier_traffic = best_traffic[last_at_buffer]
-    improved = np.r_[True, frontier_traffic[1:] < frontier_traffic[:-1]]
+    frontier_buffer_list: list[int] = []
+    frontier_traffic_list: list[int] = []
+    frontier_stage_list: list[int] = []
+    best_traffic = None
+    best_stage_bytes = None
+    for required_buffer, group_iter in groupby(pairs, key=lambda item: item[0]):
+        for _, traffic_bytes, stage_bytes in group_iter:
+            if (
+                best_traffic is None
+                or traffic_bytes < best_traffic
+                or (
+                    traffic_bytes == best_traffic
+                    and best_stage_bytes is not None
+                    and stage_bytes > best_stage_bytes
+                )
+            ):
+                best_traffic = traffic_bytes
+                best_stage_bytes = stage_bytes
+        if best_traffic is None or best_stage_bytes is None:
+            raise RuntimeError("no GEMM mapping point was enumerated")
+        frontier_buffer_list.append(required_buffer)
+        frontier_traffic_list.append(best_traffic)
+        frontier_stage_list.append(best_stage_bytes)
+
+    frontier_buffers = np.array(frontier_buffer_list, dtype=np.int64)
+    frontier_traffic = np.array(frontier_traffic_list, dtype=np.int64)
+    frontier_stage_bytes = np.array(frontier_stage_list, dtype=np.int64)
+    improved = np.r_[
+        True,
+        (frontier_traffic[1:] < frontier_traffic[:-1])
+        | (frontier_stage_bytes[1:] > frontier_stage_bytes[:-1]),
+    ]
 
     return TrafficFrontier(
         label=group.label,
@@ -311,6 +349,7 @@ def build_traffic_frontier(group: GemmTaskGroup) -> TrafficFrontier:
         operations=group.task.operations,
         buffer_bytes=frontier_buffers[improved],
         traffic_bytes=frontier_traffic[improved],
+        stage_bytes=frontier_stage_bytes[improved],
     )
 
 
@@ -323,9 +362,9 @@ def output_paths() -> tuple[str, str, str]:
     suffix = "" if not suffix_parts else "_" + "_".join(suffix_parts)
 
     return (
-        f"./result/ffn_area{suffix}_times.csv",
-        f"./result/ffn_area{suffix}_total_time.png",
-        f"./result/ffn_area{suffix}_activation_time.png",
+        f"./result/ffn_area_latency{suffix}_times.csv",
+        f"./result/ffn_area_latency{suffix}_total_time.png",
+        f"./result/ffn_area_latency{suffix}_activation_time.png",
     )
 
 
@@ -350,12 +389,26 @@ def min_traffic_from_frontier(
     return min_traffic
 
 
+def stage_bytes_from_frontier(
+    frontier: TrafficFrontier, capacities: np.ndarray
+) -> np.ndarray:
+    indexes = np.searchsorted(frontier.buffer_bytes, capacities, side="right") - 1
+    stage_bytes = np.full(len(capacities), np.nan, dtype=float)
+    valid = indexes >= 0
+    stage_bytes[valid] = frontier.stage_bytes[indexes[valid]]
+    return stage_bytes
+
+
 def gemm_time_from_frontier(
     frontier: TrafficFrontier, capacities: np.ndarray, tensor_roof: np.ndarray
 ) -> np.ndarray:
     min_traffic = min_traffic_from_frontier(frontier, capacities)
+    stage_bytes = stage_bytes_from_frontier(frontier, capacities)
     oi = frontier.operations / min_traffic
-    memory_roof = oi * bw
+    latency_seconds = HBM_LATENCY_CYCLES / CUDA_CLOCK_HZ
+    latency_limited_bw = PIPELINE_NUM_STAGES * stage_bytes / latency_seconds
+    effective_bw = np.minimum(bw, latency_limited_bw)
+    memory_roof = oi * effective_bw
     peak = np.minimum(memory_roof, tensor_roof)
 
     time_seconds = np.full(len(capacities), np.nan, dtype=float)
@@ -702,6 +755,8 @@ def main() -> None:
         print(f"Fully tiled allowed loop orders: {', '.join(allowed)}")
     print(f"Output CSV: {csv_path}")
     print(f"Unique GEMM groups: {len(task_groups)}")
+    print(f"Pipeline num_stages: {PIPELINE_NUM_STAGES}")
+    print(f"HBM latency: {HBM_LATENCY_CYCLES} cycles")
     print(f"Router top-k implied by token routing: {ROUTER_TOP_K}")
     print(
         "Expert distribution model: "

@@ -10,7 +10,7 @@ from snowcat_demo.model.pareto import best_at_capacity
 from snowcat_demo.model.workload import GemmWorkload
 
 
-DEFAULT_GEMM_MNK = (1024, 1024, 1024)
+DEFAULT_GEMM_MNK = (128, 4096, 4096)
 DEFAULT_BYTES_PER_ELEMENT = 2
 
 

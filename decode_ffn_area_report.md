@@ -1,8 +1,8 @@
 # Decode FFN Area-Balance Report
 
 ## Assumptions
-1. Workload is 8192-batched GLM-5.2
-    - Experts: 512
+1. Workload is 4096-batched GLM-5.2
+    - Experts: 256
     - Router Top-K: 8
     - Hidden Size: 6144
     - Intermediate Size: 2048
@@ -30,7 +30,7 @@
 <!-- ## Formulas
 
 ```text
-top_k = experts * tokens_per_expert / batch_tokens = 512 * 128 / 8192 = 8
+top_k = experts * tokens_per_expert / batch_tokens = 256 * 128 / 4096 = 8
 
 rc = CUDA-core area fraction
 rt = tensor-core area fraction
@@ -62,10 +62,12 @@ time = max(tensor_ops / tensor_roof,
            cuda_epilogue_ops / cuda_roof,
            fused_HBM_traffic / bw)
 
-Latency-aware HBM:
+Latency-aware HBM (per-kernel num_stages C):
 latency_seconds = 500 / 1.410e9 = 354.61 ns
-required_smem = num_stages * stage_bytes
-BW_eff = min(bw, num_stages * stage_bytes / latency_seconds)
+W = buffer_bytes (one-stage tile working set)
+C_best = min(floor(S_total / W), ceil(bw * latency / W))
+BW_eff = min(bw, C_best * W / latency_seconds)
+time = count * max(ops / tensor_roof, traffic / BW_eff)
 ``` -->
 
 ## Workloads
@@ -74,23 +76,23 @@ BW_eff = min(bw, num_stages * stage_bytes / latency_seconds)
 |---|---|---|
 | RMSNorm | square-reduction | square-reduction |
 | Router | router GEMM | router + RMS-scale |
-| Up/Gate | up_gate GEMM x512 + SwiGLU | up_gate + RMS-scale + SwiGLU x512 |
-| Down | down GEMM x512 | down GEMM x512 |
-| Expert combine | weighted sum over 8192 tokens, top-k=8 | same |
+| Up/Gate | up_gate GEMM x256 + SwiGLU | up_gate + RMS-scale + SwiGLU x256 |
+| Down | down GEMM x256 | down GEMM x256 |
+| Expert combine | weighted sum over 4096 tokens, top-k=8 | same |
 | Output | residual add | same |
 
 | GEMM | Shape | Count | Ops |
 |---|---:|---:|---:|
-| router | M=8192, N=512, K=6144 | 1 | 51.540 GFLOP |
-| up_gate | M=128, N=4096, K=6144 | 512 | 3298.535 GFLOP |
-| down | M=128, N=6144, K=2048 | 512 | 1649.267 GFLOP |
+| router | M=4096, N=256, K=6144 | 1 | 12.885 GFLOP |
+| up_gate | M=128, N=4096, K=6144 | 256 | 1649.267 GFLOP |
+| down | M=128, N=6144, K=2048 | 256 | 824.634 GFLOP |
 
 | Vector/reduction | Ops | HBM traffic | OI |
 |---|---:|---:|---:|
-| RMSNorm square-reduction | 100.655 MFLOP | 96.031 MiB | 0.9996 |
-| activation | 1073.742 MFLOP | 768.000 MiB | 1.3333 |
-| expert weighted sum | 754.975 MFLOP | 864.125 MiB | 0.8332 |
-| residual add | 50.332 MFLOP | 288.000 MiB | 0.1667 |
+| RMSNorm square-reduction | 50.328 MFLOP | 48.016 MiB | 0.9996 |
+| activation | 536.871 MFLOP | 384.000 MiB | 1.3333 |
+| expert weighted sum | 377.487 MFLOP | 432.062 MiB | 0.8332 |
+| residual add | 25.166 MFLOP | 144.000 MiB | 0.1667 |
 
 ## Graphs
 
@@ -103,42 +105,62 @@ BW_eff = min(bw, num_stages * stage_bytes / latency_seconds)
 
 | Model | Workload | rc | rt | SMEM frac | SMEM MiB | CUDA cores | Tensor cores | Time | Throughput |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| Original | Unfused | 0.018 | 0.976 | 0.006 | 1.128 | 490 | 886 | 21.283 ms | 234.996 TFLOP/s |
-| Original | Fused | 0.014 | 0.979 | 0.007 | 1.316 | 381 | 889 | 20.756 ms | 240.972 TFLOP/s |
-| Latency-aware | Unfused | 0.018 | 0.960 | 0.022 | 4.137 | 490 | 871 | 21.285 ms | 234.974 TFLOP/s |
-| Latency-aware | Fused | 0.014 | 0.964 | 0.022 | 4.137 | 381 | 875 | 20.758 ms | 240.951 TFLOP/s |
+| Original | Unfused | 0.018 | 0.970 | 0.012 | 2.257 | 490 | 880 | 10.613 ms | 234.406 TFLOP/s |
+| Original | Fused | 0.014 | 0.974 | 0.012 | 2.257 | 381 | 884 | 10.350 ms | 240.382 TFLOP/s |
+| Latency-aware | Unfused | 0.018 | 0.970 | 0.012 | 2.257 | 490 | 880 | 10.613 ms | 234.406 TFLOP/s |
+| Latency-aware | Fused | 0.014 | 0.974 | 0.012 | 2.257 | 381 | 884 | 10.350 ms | 240.382 TFLOP/s |
 
 | Comparison | Time ratio | Throughput ratio | SMEM MiB ratio |
 |---|---:|---:|---:|
-| Fused vs. unfused, original | 1.0254x faster | 1.0254x higher | 1.167x |
-| Fused vs. unfused, latency-aware | 1.0254x faster | 1.0254x higher | 1.000x |
-| Latency-aware vs. original, unfused | 1.00009x slower | 0.99991x | 3.667x |
-| Latency-aware vs. original, fused | 1.00009x slower | 0.99991x | 3.143x |
+| Fused vs. unfused, original | 1.0254x faster | 1.0255x higher | 1.000x |
+| Fused vs. unfused, latency-aware | 1.0254x faster | 1.0255x higher | 1.000x |
+| Latency-aware vs. original, unfused | 1.0000x | 1.0000x | 1.000x |
+| Latency-aware vs. original, fused | 1.0000x | 1.0000x | 1.000x |
 
 ## Stage Results
 
 | Stage/group | Unfused time | Fused time | Unfused HBM | Fused HBM | Unfused OI | Fused OI |
 |---|---:|---:|---:|---:|---:|---:|
-| RMSNorm square-reduction | 0.049 ms | 0.049 ms | 96.031 MiB | 96.031 MiB | 1.000 | 1.000 |
-| router / router_rms_scale | 0.114 ms | 0.113 ms | 152.000 MiB | 152.016 MiB | 323.368 | 323.361 |
-| up_gate + activation / up_gate_rms_swiglu | 13.685 ms | 13.159 ms | 26624.000 MiB | 25600.125 MiB | 118.192 | 122.929 |
-| down_x512 | 6.842 ms | 6.842 ms | 13312.000 MiB | 13312.000 MiB | 118.154 | 118.154 |
-| expert_weighted_sum | 0.444 ms | 0.444 ms | 864.125 MiB | 864.125 MiB | 0.833 | 0.833 |
-| residual_add | 0.148 ms | 0.148 ms | 288.000 MiB | 288.000 MiB | 0.167 | 0.167 |
+| RMSNorm square-reduction | 0.025 ms | 0.025 ms | 48.016 MiB | 48.016 MiB | 1.000 | 1.000 |
+| router / router_rms_scale | 0.029 ms | 0.028 ms | 53.000 MiB | 53.008 MiB | 231.849 | 231.834 |
+| up_gate + activation / up_gate_rms_swiglu | 6.842 ms | 6.579 ms | 13312.000 MiB | 12800.062 MiB | 121.663 | 122.929 |
+| down_x512 | 3.421 ms | 3.421 ms | 6656.000 MiB | 6656.000 MiB | 118.154 | 118.154 |
+| expert_weighted_sum | 0.222 ms | 0.222 ms | 432.062 MiB | 432.062 MiB | 0.833 | 0.833 |
+| residual_add | 0.074 ms | 0.074 ms | 144.000 MiB | 144.000 MiB | 0.167 | 0.167 |
 
 | Fused stage/group | Saved HBM | Time saved | Speedup |
 |---|---:|---:|---:|
-| router_rms_scale | -0.016 MiB | 0.000 ms | 1.003x |
-| up_gate_rms_swiglu | 1023.875 MiB | 0.526 ms | 1.040x |
+| router_rms_scale | -0.008 MiB | 0.000 ms | 1.005x |
+| up_gate_rms_swiglu | 511.938 MiB | 0.263 ms | 1.040x |
 | down + weighted sum + residual | 0.000 MiB | 0.000 ms | 1.000x |
 
 ## Latency-Aware Stage Results
 
 | Stage/group | Unfused time | Fused time | Unfused HBM | Fused HBM | Unfused OI | Fused OI |
 |---|---:|---:|---:|---:|---:|---:|
-| RMSNorm square-reduction | 0.049 ms | 0.049 ms | 96.031 MiB | 96.031 MiB | 1.000 | 1.000 |
-| router / router_rms_scale | 0.116 ms | 0.115 ms | 152.000 MiB | 152.016 MiB | 323.368 | 323.361 |
-| up_gate + activation / up_gate_rms_swiglu | 13.685 ms | 13.159 ms | 26624.000 MiB | 25600.125 MiB | 118.192 | 122.929 |
-| down_x512 | 6.842 ms | 6.842 ms | 13312.000 MiB | 13312.000 MiB | 118.154 | 118.154 |
-| expert_weighted_sum | 0.444 ms | 0.444 ms | 864.125 MiB | 864.125 MiB | 0.833 | 0.833 |
-| residual_add | 0.148 ms | 0.148 ms | 288.000 MiB | 288.000 MiB | 0.167 | 0.167 |
+| RMSNorm square-reduction | 0.025 ms | 0.025 ms | 48.016 MiB | 48.016 MiB | 1.000 | 1.000 |
+| router / router_rms_scale | 0.029 ms | 0.028 ms | 53.000 MiB | 53.008 MiB | 231.849 | 231.834 |
+| up_gate + activation / up_gate_rms_swiglu | 6.842 ms | 6.579 ms | 13312.000 MiB | 12800.062 MiB | 121.663 | 122.929 |
+| down_x512 | 3.421 ms | 3.421 ms | 6656.000 MiB | 6656.000 MiB | 118.154 | 118.154 |
+| expert_weighted_sum | 0.222 ms | 0.222 ms | 432.062 MiB | 432.062 MiB | 0.833 | 0.833 |
+| residual_add | 0.074 ms | 0.074 ms | 144.000 MiB | 144.000 MiB | 0.167 | 0.167 |
+
+## Latency Results
+| HBM Latency (cycles) | Optimal num_stages | Optimal SMEM (MiB) | Total Run Time (ms) |
+|---|---:|---:|---:|
+| 500 | 1 | 2.257 | 10.61 |
+| 1000 | 2 | 2.633 | 10.61 |
+| 2000 | 3 | 3.573 | 10.61 |
+| 4000 | 5 | 6.582 | 10.61 |
+| 8000 | 10 | 11.471 | 10.61 |
+| 16000 | 20 | 22.941 | 10.62 |
+| 32000 | 40 | 45.507 | 10.62 |
+| 64000 | 77 | 87.065 | 10.88 |
+
+## Bandwidth Results
+| HBM Bandwidth (TB/s) | Optimal num_stages | Optimal SMEM (MiB) | Total Run Time (ms) |
+|---|---:|---:|---:|
+| 1 | 1 | 92.518 | 21.65 |
+| 2.04 | 1 | 2.257 | 10.61 |
+| 4 | 3 | 1.880 | 5.85 |
+| 8 | 5 | 1.504 | 5.79 |

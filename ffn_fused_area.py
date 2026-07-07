@@ -44,8 +44,8 @@ A_tensor_core = TENSOR_CORE_TRANSISTORS / logic_density
 
 # Decode FFN workload.
 BYTE_PER_ELEMENT = 2
-BATCH_TOKENS = 8192
-EXPERTS = 512
+BATCH_TOKENS = 4096
+EXPERTS = 256
 TOKENS_PER_EXPERT = 128
 HIDDEN_SIZE = 6144
 INTERMEDIATE_SIZE = 2048
@@ -61,7 +61,7 @@ AREA_GRID_STEP = 0.001
 # False preserves the original fused Snowcat-style mapspace and output
 # filenames.  True restricts fused GEMM mappings to M-N-K and N-M-K, where the
 # output accumulator tile stays live through the K reduction.
-USE_REGISTER_ACCUMULATOR_MAPPINGS = False
+USE_REGISTER_ACCUMULATOR_MAPPINGS = True
 
 # False preserves the original even-routing estimate: every expert receives
 # TOKENS_PER_EXPERT tokens.  True uses an expected-value random-routing model
@@ -169,6 +169,10 @@ class FusedTrafficFrontier:
     stage: FusedGemmStage
     buffer_bytes: np.ndarray
     traffic_bytes: np.ndarray
+    bm: np.ndarray
+    bn: np.ndarray
+    bk: np.ndarray
+    loop_orders: tuple[tuple[str, str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -193,6 +197,10 @@ class StandardTrafficFrontier:
     stage: StandardGemmStage
     buffer_bytes: np.ndarray
     traffic_bytes: np.ndarray
+    bm: np.ndarray
+    bn: np.ndarray
+    bk: np.ndarray
+    loop_orders: tuple[tuple[str, str, str], ...]
 
 
 RMSNORM_SQUARE_REDUCTION_TASK = ReductionTask(
@@ -391,21 +399,61 @@ def build_fused_frontier(stage: FusedGemmStage) -> FusedTrafficFrontier:
             f"BN>={TENSOR_CORE_MIN_BN}, BK>={TENSOR_CORE_MIN_BK}"
         )
     pairs = sorted(
-        (point.buffer_bytes, point.hbm_bytes) for point in points
+        (
+            point.buffer_bytes,
+            point.hbm_bytes,
+            point.bm,
+            point.bn,
+            point.bk,
+            point.loop_order,
+        )
+        for point in points
     )
-    buffers = np.fromiter((buffer for buffer, _ in pairs), dtype=np.int64)
-    traffic = np.fromiter((bytes_ for _, bytes_ in pairs), dtype=np.int64)
 
-    best_traffic = np.minimum.accumulate(traffic)
-    last_at_buffer = np.r_[buffers[1:] != buffers[:-1], True]
-    frontier_buffers = buffers[last_at_buffer]
-    frontier_traffic = best_traffic[last_at_buffer]
+    frontier_buffer_list: list[int] = []
+    frontier_traffic_list: list[int] = []
+    frontier_bm_list: list[int] = []
+    frontier_bn_list: list[int] = []
+    frontier_bk_list: list[int] = []
+    frontier_loop_order_list: list[tuple[str, str, str]] = []
+    best: tuple[int, int, int, int, tuple[str, str, str]] | None = None
+
+    for buffer_bytes, traffic_bytes, bm, bn, bk, loop_order in pairs:
+        if best is None or traffic_bytes < best[0]:
+            best = (traffic_bytes, bm, bn, bk, loop_order)
+        if frontier_buffer_list and buffer_bytes == frontier_buffer_list[-1]:
+            frontier_traffic_list[-1] = best[0]
+            frontier_bm_list[-1] = best[1]
+            frontier_bn_list[-1] = best[2]
+            frontier_bk_list[-1] = best[3]
+            frontier_loop_order_list[-1] = best[4]
+        else:
+            frontier_buffer_list.append(buffer_bytes)
+            frontier_traffic_list.append(best[0])
+            frontier_bm_list.append(best[1])
+            frontier_bn_list.append(best[2])
+            frontier_bk_list.append(best[3])
+            frontier_loop_order_list.append(best[4])
+
+    frontier_buffers = np.array(frontier_buffer_list, dtype=np.int64)
+    frontier_traffic = np.array(frontier_traffic_list, dtype=np.int64)
+    frontier_bm = np.array(frontier_bm_list, dtype=np.int64)
+    frontier_bn = np.array(frontier_bn_list, dtype=np.int64)
+    frontier_bk = np.array(frontier_bk_list, dtype=np.int64)
     improved = np.r_[True, frontier_traffic[1:] < frontier_traffic[:-1]]
 
     return FusedTrafficFrontier(
         stage=stage,
         buffer_bytes=frontier_buffers[improved],
         traffic_bytes=frontier_traffic[improved],
+        bm=frontier_bm[improved],
+        bn=frontier_bn[improved],
+        bk=frontier_bk[improved],
+        loop_orders=tuple(
+            loop_order
+            for keep, loop_order in zip(improved, frontier_loop_order_list)
+            if keep
+        ),
     )
 
 
@@ -417,7 +465,14 @@ def build_standard_frontier(stage: StandardGemmStage) -> StandardTrafficFrontier
         bytes_per_element=BYTE_PER_ELEMENT,
     )
     pairs = sorted(
-        (point.buffer_bytes, point.backing_store_bytes)
+        (
+            point.buffer_bytes,
+            point.backing_store_bytes,
+            point.mapping.m0,
+            point.mapping.n0,
+            point.mapping.k0,
+            point.mapping.loop_order,
+        )
         for point in enumerate_mappings(workload)
         if tensor_core_tile_allowed(
             point.mapping.m0,
@@ -431,19 +486,51 @@ def build_standard_frontier(stage: StandardGemmStage) -> StandardTrafficFrontier
             f"requires BM>={TENSOR_CORE_MIN_BM}, "
             f"BN>={TENSOR_CORE_MIN_BN}, BK>={TENSOR_CORE_MIN_BK}"
         )
-    buffers = np.fromiter((buffer for buffer, _ in pairs), dtype=np.int64)
-    traffic = np.fromiter((bytes_ for _, bytes_ in pairs), dtype=np.int64)
 
-    best_traffic = np.minimum.accumulate(traffic)
-    last_at_buffer = np.r_[buffers[1:] != buffers[:-1], True]
-    frontier_buffers = buffers[last_at_buffer]
-    frontier_traffic = best_traffic[last_at_buffer]
+    frontier_buffer_list: list[int] = []
+    frontier_traffic_list: list[int] = []
+    frontier_bm_list: list[int] = []
+    frontier_bn_list: list[int] = []
+    frontier_bk_list: list[int] = []
+    frontier_loop_order_list: list[tuple[str, str, str]] = []
+    best: tuple[int, int, int, int, tuple[str, str, str]] | None = None
+
+    for buffer_bytes, traffic_bytes, bm, bn, bk, loop_order in pairs:
+        if best is None or traffic_bytes < best[0]:
+            best = (traffic_bytes, bm, bn, bk, loop_order)
+        if frontier_buffer_list and buffer_bytes == frontier_buffer_list[-1]:
+            frontier_traffic_list[-1] = best[0]
+            frontier_bm_list[-1] = best[1]
+            frontier_bn_list[-1] = best[2]
+            frontier_bk_list[-1] = best[3]
+            frontier_loop_order_list[-1] = best[4]
+        else:
+            frontier_buffer_list.append(buffer_bytes)
+            frontier_traffic_list.append(best[0])
+            frontier_bm_list.append(best[1])
+            frontier_bn_list.append(best[2])
+            frontier_bk_list.append(best[3])
+            frontier_loop_order_list.append(best[4])
+
+    frontier_buffers = np.array(frontier_buffer_list, dtype=np.int64)
+    frontier_traffic = np.array(frontier_traffic_list, dtype=np.int64)
+    frontier_bm = np.array(frontier_bm_list, dtype=np.int64)
+    frontier_bn = np.array(frontier_bn_list, dtype=np.int64)
+    frontier_bk = np.array(frontier_bk_list, dtype=np.int64)
     improved = np.r_[True, frontier_traffic[1:] < frontier_traffic[:-1]]
 
     return StandardTrafficFrontier(
         stage=stage,
         buffer_bytes=frontier_buffers[improved],
         traffic_bytes=frontier_traffic[improved],
+        bm=frontier_bm[improved],
+        bn=frontier_bn[improved],
+        bk=frontier_bk[improved],
+        loop_orders=tuple(
+            loop_order
+            for keep, loop_order in zip(improved, frontier_loop_order_list)
+            if keep
+        ),
     )
 
 
@@ -455,6 +542,36 @@ def min_traffic_from_frontier(
     valid = indexes >= 0
     min_traffic[valid] = frontier.traffic_bytes[indexes[valid]]
     return min_traffic
+
+
+def selected_mapping_from_frontier(
+    frontier: FusedTrafficFrontier | StandardTrafficFrontier, capacity_bytes: float
+) -> tuple[int, int, int, tuple[str, str, str], int] | None:
+    index = np.searchsorted(frontier.buffer_bytes, capacity_bytes, side="right") - 1
+    if index < 0:
+        return None
+    return (
+        int(frontier.bm[index]),
+        int(frontier.bn[index]),
+        int(frontier.bk[index]),
+        frontier.loop_orders[index],
+        int(frontier.buffer_bytes[index]),
+    )
+
+
+def format_selected_mapping(
+    frontier: FusedTrafficFrontier | StandardTrafficFrontier, capacity_bytes: float
+) -> str:
+    mapping = selected_mapping_from_frontier(frontier, capacity_bytes)
+    if mapping is None:
+        return "no mapping fits selected SMEM capacity"
+    bm, bn, bk, loop_order, stage_smem_bytes = mapping
+    return (
+        f"BM={bm}, BN={bn}, BK={bk}, "
+        f"loop_order={'-'.join(loop_order)}, "
+        f"stage_smem={stage_smem_bytes / 2**20:.6f} MiB "
+        f"({stage_smem_bytes} bytes)"
+    )
 
 
 def fused_stage_time(
@@ -890,12 +1007,33 @@ def main() -> None:
     )
 
     print("\n=== GEMM / Fused GEMM Stages ===")
+    frontiers_by_aggregate: dict[
+        str, list[FusedTrafficFrontier | StandardTrafficFrontier]
+    ] = {}
+    for frontier in [*fused_frontiers, *standard_frontiers]:
+        aggregate_name = aggregate_names[frontier.stage.name]
+        frontiers_by_aggregate.setdefault(aggregate_name, []).append(frontier)
     for name in stage_times:
         traffic = stage_traffic[name][best_index]
         print(f"\n{name}")
         print(f"  time: {stage_times[name][best_index] * 1e3:.6f} ms")
         print(f"  HBM traffic: {traffic / 2**20:.3f} MiB")
         print(f"  OI: {_stage_ops_by_name[name] / traffic:.6f} FLOP/byte")
+        stage_frontiers = frontiers_by_aggregate.get(name, [])
+        if len(stage_frontiers) == 1:
+            print(
+                "  mapping: "
+                f"{format_selected_mapping(stage_frontiers[0], smem_bytes[best_index])}"
+            )
+        elif stage_frontiers:
+            print("  constituent mappings:")
+            for stage_frontier in stage_frontiers:
+                weight = stage_weights[stage_frontier.stage.name]
+                print(
+                    f"    {stage_frontier.stage.name} "
+                    f"(expected_count={weight:.8g}): "
+                    f"{format_selected_mapping(stage_frontier, smem_bytes[best_index])}"
+                )
 
     print("\n=== Remaining Vector Stages ===")
     print(

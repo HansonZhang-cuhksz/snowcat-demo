@@ -51,6 +51,9 @@ TOKENS_PER_EXPERT = 128
 HIDDEN_SIZE = 6144
 INTERMEDIATE_SIZE = 2048
 ROUTER_TOP_K = EXPERTS * TOKENS_PER_EXPERT // BATCH_TOKENS
+TENSOR_CORE_MIN_BM = 16
+TENSOR_CORE_MIN_BN = 8
+TENSOR_CORE_MIN_BK = 16
 
 SWIGLU_FLOPS_PER_ELEMENT = 8.0
 INCLUDE_RMSNORM = True
@@ -377,14 +380,33 @@ def output_paths() -> tuple[str, str]:
     )
 
 
+def tensor_core_tile_allowed(bm: int, bn: int, bk: int) -> bool:
+    return (
+        bm >= TENSOR_CORE_MIN_BM
+        and bn >= TENSOR_CORE_MIN_BN
+        and bk >= TENSOR_CORE_MIN_BK
+    )
+
+
 def build_fused_frontier(stage: FusedGemmStage) -> FusedTrafficFrontier:
+    points = [
+        point
+        for point in stage.traffic_points_fn()
+        if tensor_core_tile_allowed(point.bm, point.bn, point.bk)
+    ]
+    if not points:
+        raise ValueError(
+            f"no tensor-core-compatible fused mapping for {stage.name}; "
+            f"requires BM>={TENSOR_CORE_MIN_BM}, "
+            f"BN>={TENSOR_CORE_MIN_BN}, BK>={TENSOR_CORE_MIN_BK}"
+        )
     pairs = sorted(
         (
             point.buffer_bytes * PIPELINE_NUM_STAGES,
             point.hbm_bytes,
             point.buffer_bytes,
         )
-        for point in stage.traffic_points_fn()
+        for point in points
     )
 
     frontier_buffer_list: list[int] = []
@@ -442,7 +464,18 @@ def build_standard_frontier(stage: StandardGemmStage) -> StandardTrafficFrontier
             point.buffer_bytes,
         )
         for point in enumerate_mappings(workload)
+        if tensor_core_tile_allowed(
+            point.mapping.m0,
+            point.mapping.n0,
+            point.mapping.k0,
+        )
     )
+    if not pairs:
+        raise ValueError(
+            f"no tensor-core-compatible standard mapping for {stage.name}; "
+            f"requires BM>={TENSOR_CORE_MIN_BM}, "
+            f"BN>={TENSOR_CORE_MIN_BN}, BK>={TENSOR_CORE_MIN_BK}"
+        )
 
     frontier_buffer_list: list[int] = []
     frontier_traffic_list: list[int] = []
@@ -594,6 +627,17 @@ def streaming_cuda_time(
     return time_seconds
 
 
+def total_hbm_traffic_bytes(stage_traffic: dict[str, np.ndarray]) -> np.ndarray:
+    total = np.zeros_like(next(iter(stage_traffic.values())), dtype=float)
+    for traffic_bytes in stage_traffic.values():
+        total = total + traffic_bytes
+    if INCLUDE_RMSNORM:
+        total = total + RMSNORM_SQUARE_REDUCTION_TASK.traffic_bytes
+    total = total + EXPERT_WEIGHTED_SUM_TASK.traffic_bytes
+    total = total + RESIDUAL_ADD_TASK.traffic_bytes
+    return total
+
+
 def make_area_grid(step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     values = np.arange(step, 1.0, step)
     rc_values = []
@@ -640,6 +684,7 @@ def write_csv(
             "cuda_cores",
             "tensor_cores",
             "total_time_ms",
+            "total_hbm_mib",
             "effective_tflops",
             "rmsnorm_square_reduction_time_ms",
             "expert_weighted_sum_time_ms",
@@ -655,6 +700,7 @@ def write_csv(
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
+        total_hbm_traffic = total_hbm_traffic_bytes(stage_traffic)
 
         for index in range(len(rc)):
             row = {
@@ -665,6 +711,7 @@ def write_csv(
                 "cuda_cores": cuda_cores[index],
                 "tensor_cores": tensor_cores[index],
                 "total_time_ms": total_time[index] * 1e3,
+                "total_hbm_mib": total_hbm_traffic[index] / 2**20,
                 "effective_tflops": modeled_operations / total_time[index] / 1e12,
                 "rmsnorm_square_reduction_time_ms": rmsnorm_time[index] * 1e3,
                 "expert_weighted_sum_time_ms": expert_weighted_sum_time[index] * 1e3,
@@ -867,7 +914,9 @@ def main() -> None:
 
     best_index = int(np.nanargmin(total_time))
     effective_flops = modeled_operations / total_time[best_index]
+    total_hbm_traffic = total_hbm_traffic_bytes(stage_traffic)
 
+    print("\n=== Configuration ===")
     print(f"Fused stages: {len(fused_stages)}")
     print(f"Standard GEMM stages: {len(standard_stages)}")
     print(
@@ -917,6 +966,8 @@ def main() -> None:
         "RMSNorm square-reduction OI: "
         f"{RMSNORM_SQUARE_REDUCTION_TASK.operational_intensity:.6f} FLOP/byte"
     )
+
+    print("\n=== Best Area Point ===")
     print(f"Best rc: {rc[best_index]:.6g}")
     print(f"Best rt: {rt[best_index]:.6g}")
     print(f"Best SMEM fraction: {r_smem[best_index]:.6g}")
@@ -924,17 +975,25 @@ def main() -> None:
     print(f"CUDA Cores: {int(cuda_cores[best_index])}")
     print(f"Tensor Cores: {int(tensor_cores[best_index])}")
     print(f"Total execution time: {total_time[best_index] * 1e3:.6f} ms")
+    print(f"Total HBM traffic: {total_hbm_traffic[best_index] / 2**20:.3f} MiB")
     print(f"Effective throughput: {effective_flops / 1e12:.3f} TFLOP/s")
+
+    print("\n=== Vector / Reduction Stages ===")
     print(f"rmsnorm_square_reduction time: {rmsnorm_time[best_index] * 1e3:.6f} ms")
     print(
         "rmsnorm_square_reduction HBM traffic: "
         f"{RMSNORM_SQUARE_REDUCTION_TASK.traffic_bytes / 2**20:.3f} MiB"
     )
+
+    print("\n=== GEMM / Fused GEMM Stages ===")
     for name in stage_times:
         traffic = stage_traffic[name][best_index]
-        print(f"{name} time: {stage_times[name][best_index] * 1e3:.6f} ms")
-        print(f"{name} HBM traffic: {traffic / 2**20:.3f} MiB")
-        print(f"{name} OI: {_stage_ops_by_name[name] / traffic:.6f} FLOP/byte")
+        print(f"\n{name}")
+        print(f"  time: {stage_times[name][best_index] * 1e3:.6f} ms")
+        print(f"  HBM traffic: {traffic / 2**20:.3f} MiB")
+        print(f"  OI: {_stage_ops_by_name[name] / traffic:.6f} FLOP/byte")
+
+    print("\n=== Remaining Vector Stages ===")
     print(
         "expert_weighted_sum time: "
         f"{expert_weighted_sum_time[best_index] * 1e3:.6f} ms"

@@ -46,6 +46,9 @@ TOKENS_PER_EXPERT = 128
 HIDDEN_SIZE = 6144
 INTERMEDIATE_SIZE = 2048
 ROUTER_TOP_K = EXPERTS * TOKENS_PER_EXPERT // BATCH_TOKENS
+TENSOR_CORE_MIN_BM = 16
+TENSOR_CORE_MIN_BN = 8
+TENSOR_CORE_MIN_BK = 16
 
 # Fused SwiGLU activation: SiLU(gate) * up. FLOP accounting for exp/sigmoid is
 # implementation dependent, so keep this as a measured/estimated placeholder.
@@ -182,6 +185,10 @@ class TrafficFrontier:
     buffer_bytes: np.ndarray
     traffic_bytes: np.ndarray
     stage_bytes: np.ndarray
+    bm: np.ndarray
+    bn: np.ndarray
+    bk: np.ndarray
+    loop_orders: tuple[tuple[str, str, str], ...]
 
 
 GEMM_TASKS = [
@@ -288,6 +295,14 @@ def group_random_expert_gemm_tasks(
     return task_groups, expert_weights, aggregate_names
 
 
+def tensor_core_tile_allowed(bm: int, bn: int, bk: int) -> bool:
+    return (
+        bm >= TENSOR_CORE_MIN_BM
+        and bn >= TENSOR_CORE_MIN_BN
+        and bk >= TENSOR_CORE_MIN_BK
+    )
+
+
 def build_traffic_frontier(group: GemmTaskGroup) -> TrafficFrontier:
     task = group.task
     workload = GemmWorkload(
@@ -301,11 +316,30 @@ def build_traffic_frontier(group: GemmTaskGroup) -> TrafficFrontier:
         if USE_REGISTER_ACCUMULATOR_MAPPINGS
         else enumerate_mappings(workload)
     )
+    mapping_points = [
+        point
+        for point in mapping_points
+        if tensor_core_tile_allowed(
+            point.mapping.m0,
+            point.mapping.n0,
+            point.mapping.k0,
+        )
+    ]
+    if not mapping_points:
+        raise ValueError(
+            f"no tensor-core-compatible mapping for {group.label}; "
+            f"requires BM>={TENSOR_CORE_MIN_BM}, "
+            f"BN>={TENSOR_CORE_MIN_BN}, BK>={TENSOR_CORE_MIN_BK}"
+        )
     pairs = sorted(
         (
             point.buffer_bytes * PIPELINE_NUM_STAGES,
             point.backing_store_bytes,
             point.buffer_bytes,
+            point.mapping.m0,
+            point.mapping.n0,
+            point.mapping.k0,
+            point.mapping.loop_order,
         )
         for point in mapping_points
     )
@@ -313,10 +347,15 @@ def build_traffic_frontier(group: GemmTaskGroup) -> TrafficFrontier:
     frontier_buffer_list: list[int] = []
     frontier_traffic_list: list[int] = []
     frontier_stage_list: list[int] = []
+    frontier_bm_list: list[int] = []
+    frontier_bn_list: list[int] = []
+    frontier_bk_list: list[int] = []
+    frontier_loop_order_list: list[tuple[str, str, str]] = []
     best_traffic = None
     best_stage_bytes = None
+    best_mapping: tuple[int, int, int, tuple[str, str, str]] | None = None
     for required_buffer, group_iter in groupby(pairs, key=lambda item: item[0]):
-        for _, traffic_bytes, stage_bytes in group_iter:
+        for _, traffic_bytes, stage_bytes, bm, bn, bk, loop_order in group_iter:
             if (
                 best_traffic is None
                 or traffic_bytes < best_traffic
@@ -328,15 +367,23 @@ def build_traffic_frontier(group: GemmTaskGroup) -> TrafficFrontier:
             ):
                 best_traffic = traffic_bytes
                 best_stage_bytes = stage_bytes
-        if best_traffic is None or best_stage_bytes is None:
+                best_mapping = (bm, bn, bk, loop_order)
+        if best_traffic is None or best_stage_bytes is None or best_mapping is None:
             raise RuntimeError("no GEMM mapping point was enumerated")
         frontier_buffer_list.append(required_buffer)
         frontier_traffic_list.append(best_traffic)
         frontier_stage_list.append(best_stage_bytes)
+        frontier_bm_list.append(best_mapping[0])
+        frontier_bn_list.append(best_mapping[1])
+        frontier_bk_list.append(best_mapping[2])
+        frontier_loop_order_list.append(best_mapping[3])
 
     frontier_buffers = np.array(frontier_buffer_list, dtype=np.int64)
     frontier_traffic = np.array(frontier_traffic_list, dtype=np.int64)
     frontier_stage_bytes = np.array(frontier_stage_list, dtype=np.int64)
+    frontier_bm = np.array(frontier_bm_list, dtype=np.int64)
+    frontier_bn = np.array(frontier_bn_list, dtype=np.int64)
+    frontier_bk = np.array(frontier_bk_list, dtype=np.int64)
     improved = np.r_[
         True,
         (frontier_traffic[1:] < frontier_traffic[:-1])
@@ -350,6 +397,14 @@ def build_traffic_frontier(group: GemmTaskGroup) -> TrafficFrontier:
         buffer_bytes=frontier_buffers[improved],
         traffic_bytes=frontier_traffic[improved],
         stage_bytes=frontier_stage_bytes[improved],
+        bm=frontier_bm[improved],
+        bn=frontier_bn[improved],
+        bk=frontier_bk[improved],
+        loop_orders=tuple(
+            loop_order
+            for keep, loop_order in zip(improved, frontier_loop_order_list)
+            if keep
+        ),
     )
 
 
@@ -399,6 +454,37 @@ def stage_bytes_from_frontier(
     return stage_bytes
 
 
+def selected_mapping_from_frontier(
+    frontier: TrafficFrontier, capacity_bytes: float
+) -> tuple[int, int, int, tuple[str, str, str], int, int] | None:
+    index = np.searchsorted(frontier.buffer_bytes, capacity_bytes, side="right") - 1
+    if index < 0:
+        return None
+    return (
+        int(frontier.bm[index]),
+        int(frontier.bn[index]),
+        int(frontier.bk[index]),
+        frontier.loop_orders[index],
+        int(frontier.buffer_bytes[index]),
+        int(frontier.stage_bytes[index]),
+    )
+
+
+def format_selected_mapping(frontier: TrafficFrontier, capacity_bytes: float) -> str:
+    mapping = selected_mapping_from_frontier(frontier, capacity_bytes)
+    if mapping is None:
+        return "no mapping fits selected SMEM capacity"
+    bm, bn, bk, loop_order, required_smem_bytes, one_stage_bytes = mapping
+    return (
+        f"BM={bm}, BN={bn}, BK={bk}, "
+        f"loop_order={'-'.join(loop_order)}, "
+        f"required_smem={required_smem_bytes / 2**20:.6f} MiB "
+        f"({required_smem_bytes} bytes), "
+        f"one_stage_smem={one_stage_bytes / 2**20:.6f} MiB "
+        f"({one_stage_bytes} bytes)"
+    )
+
+
 def gemm_time_from_frontier(
     frontier: TrafficFrontier, capacities: np.ndarray, tensor_roof: np.ndarray
 ) -> np.ndarray:
@@ -444,6 +530,18 @@ def streaming_cuda_time(
     time_seconds = np.full(len(cuda_roof), np.nan, dtype=float)
     np.divide(operations, peak, out=time_seconds, where=peak > 0)
     return time_seconds
+
+
+def total_hbm_traffic_bytes(task_traffic: dict[str, np.ndarray]) -> np.ndarray:
+    total = np.zeros_like(next(iter(task_traffic.values())), dtype=float)
+    for traffic_bytes in task_traffic.values():
+        total = total + traffic_bytes
+    if INCLUDE_RMSNORM:
+        total = total + RMSNORM_SQUARE_REDUCTION_TASK.traffic_bytes
+    total = total + ACTIVATION_TASK.traffic_bytes
+    total = total + EXPERT_WEIGHTED_SUM_TASK.traffic_bytes
+    total = total + RESIDUAL_ADD_TASK.traffic_bytes
+    return total
 
 
 def make_area_grid(step: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -493,6 +591,7 @@ def write_csv(
             "cuda_cores",
             "tensor_cores",
             "total_time_ms",
+            "total_hbm_mib",
             "effective_tflops",
             "activation_oi_flops_per_byte",
             "rmsnorm_square_reduction_oi_flops_per_byte",
@@ -512,6 +611,7 @@ def write_csv(
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
+        total_hbm_traffic = total_hbm_traffic_bytes(task_traffic)
 
         for index in range(len(rc)):
             row = {
@@ -522,6 +622,7 @@ def write_csv(
                 "cuda_cores": cuda_cores[index],
                 "tensor_cores": tensor_cores[index],
                 "total_time_ms": total_time[index] * 1e3,
+                "total_hbm_mib": total_hbm_traffic[index] / 2**20,
                 "effective_tflops": modeled_operations / total_time[index] / 1e12,
                 "activation_oi_flops_per_byte": ACTIVATION_TASK.operational_intensity,
                 "rmsnorm_square_reduction_oi_flops_per_byte": (
@@ -736,7 +837,9 @@ def main() -> None:
 
     best_index = int(np.nanargmin(total_time))
     effective_flops = modeled_operations / total_time[best_index]
+    total_hbm_traffic = total_hbm_traffic_bytes(task_traffic)
 
+    print("\n=== Configuration ===")
     print(f"CPU workers available: {CPU_WORKERS}")
     print(f"Frontier build mode: {frontier_mode}")
     print(
@@ -796,6 +899,8 @@ def main() -> None:
         f"{EXPERT_WEIGHTED_SUM_TASK.operational_intensity:.6f} FLOP/byte"
     )
     print(f"Residual add OI: {RESIDUAL_ADD_TASK.operational_intensity:.6f} FLOP/byte")
+
+    print("\n=== Best Area Point ===")
     print(f"Best rc: {rc[best_index]:.6g}")
     print(f"Best rt: {rt[best_index]:.6g}")
     print(f"Best SMEM fraction: {r_smem[best_index]:.6g}")
@@ -803,15 +908,21 @@ def main() -> None:
     print(f"CUDA Cores: {int(cuda_cores[best_index])}")
     print(f"Tensor Cores: {int(tensor_cores[best_index])}")
     print(f"Total execution time: {total_time[best_index] * 1e3:.6f} ms")
+    print(f"Total HBM traffic: {total_hbm_traffic[best_index] / 2**20:.3f} MiB")
     print(f"Effective throughput: {effective_flops / 1e12:.3f} TFLOP/s")
+
+    print("\n=== GEMM Stages ===")
     for name, time_seconds in task_times.items():
-        print(f"{name} time: {time_seconds[best_index] * 1e3:.6f} ms")
+        print(f"\n{name}")
+        print(f"  time: {time_seconds[best_index] * 1e3:.6f} ms")
         traffic = task_traffic[name][best_index]
-        print(f"{name} HBM traffic: {traffic / 2**20:.3f} MiB")
+        print(f"  HBM traffic: {traffic / 2**20:.3f} MiB")
         print(
-            f"{name} OI: "
+            "  OI: "
             f"{task_operations_by_name[name] / traffic:.6f} FLOP/byte"
         )
+
+    print("\n=== Vector / Reduction Stages ===")
     print(f"rmsnorm_square_reduction time: {rmsnorm_time[best_index] * 1e3:.6f} ms")
     print(
         "rmsnorm_square_reduction HBM traffic: "

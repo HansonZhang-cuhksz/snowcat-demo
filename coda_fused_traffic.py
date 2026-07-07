@@ -18,6 +18,10 @@ LOOP_ORDERS: tuple[tuple[str, str, str], ...] = (
 class FusedTraffic:
     buffer_bytes: int
     hbm_bytes: int
+    bm: int
+    bn: int
+    bk: int
+    loop_order: tuple[str, str, str]
 
 
 def divisors(n: int) -> list[int]:
@@ -296,6 +300,10 @@ def _traffic_for_standard_output_tile(
             + output_tiles * final_tile_bytes
             + aux_hbm_bytes
         ),
+        bm=m0,
+        bn=n0,
+        bk=k0,
+        loop_order=loop_order,
     )
 
 
@@ -339,6 +347,10 @@ def _traffic_for_pairwise_output_tile(
             + output_tiles * final_tile_bytes
             + aux_hbm_bytes
         ),
+        bm=m0,
+        bn=2 * p0,
+        bk=k0,
+        loop_order=loop_order,
     )
 
 

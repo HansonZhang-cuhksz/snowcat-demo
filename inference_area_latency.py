@@ -32,7 +32,7 @@ import prefill_area_latency as pf
 
 # --- Inference scenario (tune these) ---
 PROMPT_SEQ_LEN = 1_048_576      # prefill prompt length (GLM-5.2 max context)
-DECODE_TOKENS = 150            # number of tokens generated autoregressively
+DECODE_TOKENS = 1_048_576            # number of tokens generated autoregressively
 DECODE_BATCH = 1              # decode batch = concurrent sequences
 
 

@@ -18,6 +18,7 @@ from coda_fused_register_accumulator_traffic import (
     traffic_points_gemm_rms_swiglu as traffic_points_gemm_rms_swiglu_register_accum,
 )
 from expert_distribution import ExpertTokenDistribution, binomial_expert_token_distribution
+from expert_workload import even_expert_token_split, padded_gemm_groups, padded_m
 from snowcat_demo.model.mapping import enumerate_mappings
 from snowcat_demo.model.workload import GemmWorkload
 
@@ -46,13 +47,20 @@ A_tensor_core = TENSOR_CORE_TRANSISTORS / logic_density
 BYTE_PER_ELEMENT = 2
 BATCH_TOKENS = 4096
 EXPERTS = 256
-TOKENS_PER_EXPERT = 128
+ROUTER_TOP_K = 8
 HIDDEN_SIZE = 6144
 INTERMEDIATE_SIZE = 2048
-ROUTER_TOP_K = EXPERTS * TOKENS_PER_EXPERT // BATCH_TOKENS
 TENSOR_CORE_MIN_BM = 16
 TENSOR_CORE_MIN_BN = 8
 TENSOR_CORE_MIN_BK = 16
+
+# Even token->expert distribution.  Handles small batches: ceil/floor token split when
+# batch*top_k isn't a multiple of EXPERTS, reduced active-expert count when the batch is
+# too small for every expert to get a token, and M padded to 16 for the per-expert GEMMs
+# when tokens/expert < 16 (tensor core underutilized; the SwiGLU epilogue still runs on
+# the real token count).
+EVEN_SPLIT = even_expert_token_split(BATCH_TOKENS, EXPERTS, ROUTER_TOP_K)
+TOKENS_PER_EXPERT = EVEN_SPLIT.floor_tokens  # nominal floor tokens/expert (reference)
 
 SWIGLU_FLOPS_PER_ELEMENT = 8.0
 INCLUDE_RMSNORM = True
@@ -242,55 +250,79 @@ def make_fused_stages() -> list[FusedGemmStage]:
         else traffic_points_gemm_rms_swiglu
     )
 
+    # Router runs over all batch tokens (M = batch, padded to 16 for feasibility when
+    # batch < 16); the RMS-scale epilogue uses the real batch row count.
+    router_m = padded_m(BATCH_TOKENS, TENSOR_CORE_MIN_BM)
     router = FusedGemmStage(
         name="router_rms_scale",
-        m=BATCH_TOKENS,
+        m=router_m,
         n=EXPERTS,
         k=HIDDEN_SIZE,
         count=1,
-        tensor_operations=2 * BATCH_TOKENS * EXPERTS * HIDDEN_SIZE,
+        tensor_operations=2 * router_m * EXPERTS * HIDDEN_SIZE,
         cuda_operations=BATCH_TOKENS * EXPERTS,
         traffic_points_fn=lambda: router_traffic_points_fn(
-            BATCH_TOKENS,
+            router_m,
             EXPERTS,
             HIDDEN_SIZE,
             BYTE_PER_ELEMENT,
         ),
     )
 
-    up_gate = FusedGemmStage(
-        name="up_gate_rms_swiglu_x512",
-        m=TOKENS_PER_EXPERT,
-        n=2 * INTERMEDIATE_SIZE,
-        k=HIDDEN_SIZE,
-        count=EXPERTS,
-        tensor_operations=(
-            2 * TOKENS_PER_EXPERT * (2 * INTERMEDIATE_SIZE) * HIDDEN_SIZE
-        ),
-        cuda_operations=(
-            TOKENS_PER_EXPERT * (2 * INTERMEDIATE_SIZE)
-            + TOKENS_PER_EXPERT * INTERMEDIATE_SIZE * SWIGLU_FLOPS_PER_ELEMENT
-        ),
-        traffic_points_fn=lambda: up_gate_traffic_points_fn(
-            TOKENS_PER_EXPERT,
-            2 * INTERMEDIATE_SIZE,
-            HIDDEN_SIZE,
-            BYTE_PER_ELEMENT,
-        ),
-    )
+    # One up_gate stage per distinct per-expert token count (ceil/floor split).  The
+    # GEMM (tensor) and traffic use the padded M; the SwiGLU epilogue (cuda_operations)
+    # uses the real token count.
+    stages = [router]
+    multi = len(EVEN_SPLIT.token_groups) > 1
+    for tokens, count in EVEN_SPLIT.token_groups:
+        m_pad = padded_m(tokens, TENSOR_CORE_MIN_BM)
+        name = (
+            f"up_gate_rms_swiglu_m{tokens}_x{count}"
+            if multi
+            else f"up_gate_rms_swiglu_x{count}"
+        )
+        stages.append(
+            FusedGemmStage(
+                name=name,
+                m=m_pad,
+                n=2 * INTERMEDIATE_SIZE,
+                k=HIDDEN_SIZE,
+                count=count,
+                tensor_operations=2 * m_pad * (2 * INTERMEDIATE_SIZE) * HIDDEN_SIZE,
+                cuda_operations=(
+                    tokens * (2 * INTERMEDIATE_SIZE)
+                    + tokens * INTERMEDIATE_SIZE * SWIGLU_FLOPS_PER_ELEMENT
+                ),
+                traffic_points_fn=lambda m_pad=m_pad: up_gate_traffic_points_fn(
+                    m_pad,
+                    2 * INTERMEDIATE_SIZE,
+                    HIDDEN_SIZE,
+                    BYTE_PER_ELEMENT,
+                ),
+            )
+        )
 
-    return [router, up_gate]
+    return stages
 
 
 def make_standard_stages() -> list[StandardGemmStage]:
-    down = StandardGemmStage(
-        name="down_x512",
-        m=TOKENS_PER_EXPERT,
-        n=HIDDEN_SIZE,
-        k=INTERMEDIATE_SIZE,
-        count=EXPERTS,
-    )
-    return [down]
+    # down GEMM has no epilogue, so its cost depends only on the padded M; merge experts
+    # by padded M.
+    m_groups = padded_gemm_groups(EVEN_SPLIT, TENSOR_CORE_MIN_BM)
+    multi = len(m_groups) > 1
+    stages = []
+    for m, count in m_groups:
+        name = f"down_m{m}_x{count}" if multi else f"down_x{count}"
+        stages.append(
+            StandardGemmStage(
+                name=name,
+                m=m,
+                n=HIDDEN_SIZE,
+                k=INTERMEDIATE_SIZE,
+                count=count,
+            )
+        )
+    return stages
 
 
 def expert_token_distribution() -> ExpertTokenDistribution:
@@ -324,21 +356,24 @@ def make_random_expert_stages(
         if tokens == 0:
             continue
 
+        # Pad M to the tensor-core minimum tile for the GEMM/traffic; the SwiGLU
+        # epilogue (cuda_operations) uses the real token count.
+        m_pad = padded_m(tokens, TENSOR_CORE_MIN_BM)
         up_gate_name = f"up_gate_rms_swiglu_m{tokens}"
         fused_stages.append(
             FusedGemmStage(
                 name=up_gate_name,
-                m=tokens,
+                m=m_pad,
                 n=2 * INTERMEDIATE_SIZE,
                 k=HIDDEN_SIZE,
                 count=1,
-                tensor_operations=2 * tokens * (2 * INTERMEDIATE_SIZE) * HIDDEN_SIZE,
+                tensor_operations=2 * m_pad * (2 * INTERMEDIATE_SIZE) * HIDDEN_SIZE,
                 cuda_operations=(
                     tokens * (2 * INTERMEDIATE_SIZE)
                     + tokens * INTERMEDIATE_SIZE * SWIGLU_FLOPS_PER_ELEMENT
                 ),
-                traffic_points_fn=lambda tokens=tokens: up_gate_traffic_points_fn(
-                    tokens,
+                traffic_points_fn=lambda m_pad=m_pad: up_gate_traffic_points_fn(
+                    m_pad,
                     2 * INTERMEDIATE_SIZE,
                     HIDDEN_SIZE,
                     BYTE_PER_ELEMENT,
@@ -352,7 +387,7 @@ def make_random_expert_stages(
         standard_stages.append(
             StandardGemmStage(
                 name=down_name,
-                m=tokens,
+                m=m_pad,
                 n=HIDDEN_SIZE,
                 k=INTERMEDIATE_SIZE,
                 count=1,
@@ -801,8 +836,6 @@ _stage_ops_by_name: dict[str, float] = {}
 
 
 def main() -> None:
-    if ROUTER_TOP_K * BATCH_TOKENS != EXPERTS * TOKENS_PER_EXPERT:
-        raise ValueError("Expert token count must equal batch tokens times top-k")
 
     rc, rt, r_smem = make_area_grid(AREA_GRID_STEP)
     smem_bytes = r_smem * A_total / A_bit / 8
@@ -954,7 +987,14 @@ def main() -> None:
         allowed = ["-".join(loop_order) for loop_order in REGISTER_ACCUMULATOR_LOOP_ORDERS]
         print(f"Fused allowed loop orders: {', '.join(allowed)}")
     print(f"Output CSV: {csv_path}")
-    print(f"Router top-k implied by token routing: {ROUTER_TOP_K}")
+    print(f"Batch tokens: {BATCH_TOKENS}")
+    print(f"Router top-k: {ROUTER_TOP_K}")
+    print(f"Expert token split: {EVEN_SPLIT.summary()}")
+    if EVEN_SPLIT.ceil_tokens < TENSOR_CORE_MIN_BM:
+        print(
+            f"  per-expert GEMM M padded to {TENSOR_CORE_MIN_BM} "
+            f"(tensor core underutilized; real tokens/expert < {TENSOR_CORE_MIN_BM})"
+        )
     print(
         "Expert distribution model: "
         + (

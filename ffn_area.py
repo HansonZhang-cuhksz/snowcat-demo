@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from expert_distribution import ExpertTokenDistribution, binomial_expert_token_distribution
+from expert_workload import even_expert_token_split, padded_gemm_groups, padded_m
 from register_accumulator_traffic import (
     FULLY_TILED_REGISTER_ACCUMULATOR_LOOP_ORDERS,
     enumerate_register_accumulator_mappings,
@@ -41,13 +42,19 @@ A_tensor_core = TENSOR_CORE_TRANSISTORS / logic_density
 BYTE_PER_ELEMENT = 2
 BATCH_TOKENS = 4096
 EXPERTS = 256
-TOKENS_PER_EXPERT = 128
+ROUTER_TOP_K = 8
 HIDDEN_SIZE = 6144
 INTERMEDIATE_SIZE = 2048
-ROUTER_TOP_K = EXPERTS * TOKENS_PER_EXPERT // BATCH_TOKENS
 TENSOR_CORE_MIN_BM = 16
 TENSOR_CORE_MIN_BN = 8
 TENSOR_CORE_MIN_BK = 16
+
+# Even token->expert distribution.  Handles small batches: ceil/floor token split when
+# batch*top_k isn't a multiple of EXPERTS, reduced active-expert count when the batch is
+# too small for every expert to get a token, and M padded to 16 for the per-expert GEMMs
+# when tokens/expert < 16 (tensor core underutilized).
+EVEN_SPLIT = even_expert_token_split(BATCH_TOKENS, EXPERTS, ROUTER_TOP_K)
+TOKENS_PER_EXPERT = EVEN_SPLIT.floor_tokens  # nominal floor tokens/expert (reference)
 
 # Fused SwiGLU activation: SiLU(gate) * up. FLOP accounting for exp/sigmoid is
 # implementation dependent, so keep this as a measured/estimated placeholder.
@@ -182,16 +189,12 @@ class TrafficFrontier:
     loop_orders: tuple[tuple[str, str, str], ...]
 
 
-GEMM_TASKS = [
-    GemmTask("router", BATCH_TOKENS, EXPERTS, HIDDEN_SIZE),
-    GemmTask("up_gate", TOKENS_PER_EXPERT, 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
-    GemmTask("down", TOKENS_PER_EXPERT, HIDDEN_SIZE, INTERMEDIATE_SIZE),
-]
-
+# SwiGLU runs on the real (unpadded) token->expert assignments: sum of tokens over
+# active experts = batch*top_k, independent of the ceil/floor split.
 ACTIVATION_TASK = VectorTask(
     name="activation",
-    elements=TOKENS_PER_EXPERT * INTERMEDIATE_SIZE,
-    count=EXPERTS,
+    elements=EVEN_SPLIT.total_assignments * INTERMEDIATE_SIZE,
+    count=1,
     flops_per_element=SWIGLU_FLOPS_PER_ELEMENT,
     bytes_per_element_traffic=3 * BYTE_PER_ELEMENT,
 )
@@ -223,23 +226,38 @@ RESIDUAL_ADD_TASK = VectorTask(
 )
 
 
-def group_gemm_tasks(tasks: list[GemmTask]) -> list[GemmTaskGroup]:
-    groups: dict[tuple[str, int, int, int], tuple[GemmTask, int]] = {}
-    for task in tasks:
-        key = (task.name, task.m, task.n, task.k)
-        if key in groups:
-            original_task, count = groups[key]
-            groups[key] = (original_task, count + 1)
-        else:
-            groups[key] = (task, 1)
+def build_even_expert_gemm_groups() -> tuple[
+    list[GemmTaskGroup], dict[str, float], dict[str, str]
+]:
+    """FFN GEMM groups for even routing (see expert_workload.even_expert_token_split).
 
-    task_groups = []
-    for task, count in groups.values():
-        if task.name in {"up_gate", "down"}:
-            count *= EXPERTS
-        label = task.name if count == 1 else f"{task.name}_x{count}"
-        task_groups.append(GemmTaskGroup(label=label, task=task, count=count))
-    return task_groups
+    Router runs over all EXPERTS.  The per-expert up_gate/down GEMMs are built from the
+    even ceil/floor token split: one GEMM group per distinct padded M (M = max(tokens,16)
+    for tensor-core feasibility), with ``count`` = number of active experts at that M.
+    Any GEMM whose M (batch or tokens/expert) is < 16 is padded to 16.
+    """
+    router_m = padded_m(BATCH_TOKENS, TENSOR_CORE_MIN_BM)
+    task_groups = [
+        GemmTaskGroup("router", GemmTask("router", router_m, EXPERTS, HIDDEN_SIZE), 1)
+    ]
+    group_weights = {"router": 1.0}
+    aggregate_names = {"router": "router"}
+
+    for task_name, n, k in (
+        ("up_gate", 2 * INTERMEDIATE_SIZE, HIDDEN_SIZE),
+        ("down", HIDDEN_SIZE, INTERMEDIATE_SIZE),
+    ):
+        m_groups = padded_gemm_groups(EVEN_SPLIT, TENSOR_CORE_MIN_BM)
+        multi = len(m_groups) > 1
+        for m, count in m_groups:
+            label = f"{task_name}_m{m}_x{count}" if multi else f"{task_name}_x{count}"
+            task_groups.append(
+                GemmTaskGroup(label, GemmTask(task_name, m, n, k), count)
+            )
+            group_weights[label] = 1.0
+            aggregate_names[label] = task_name
+
+    return task_groups, group_weights, aggregate_names
 
 
 def expert_token_distribution() -> ExpertTokenDistribution:
@@ -276,7 +294,9 @@ def group_random_expert_gemm_tasks(
             task_groups.append(
                 GemmTaskGroup(
                     label=label,
-                    task=GemmTask(task_name, tokens, n, k),
+                    # Pad M to the tensor-core minimum tile when an expert receives
+                    # fewer than 16 tokens (tensor core underutilized).
+                    task=GemmTask(task_name, padded_m(tokens, TENSOR_CORE_MIN_BM), n, k),
                     count=1,
                 )
             )
@@ -677,9 +697,6 @@ task_operations_by_name: dict[str, float] = {}
 
 
 def main() -> None:
-    if ROUTER_TOP_K * BATCH_TOKENS != EXPERTS * TOKENS_PER_EXPERT:
-        raise ValueError("Expert token count must equal batch tokens times top-k")
-
     task_operations_by_name.clear()
 
     rc, rt, r_smem = make_area_grid(AREA_GRID_STEP)
@@ -694,9 +711,7 @@ def main() -> None:
         expert_token_distribution() if USE_RANDOM_EXPERT_DISTRIBUTION else None
     )
     if distribution is None:
-        task_groups = group_gemm_tasks(GEMM_TASKS)
-        group_weights = {group.label: 1.0 for group in task_groups}
-        aggregate_names = {group.label: group.label for group in task_groups}
+        task_groups, group_weights, aggregate_names = build_even_expert_gemm_groups()
     else:
         task_groups, group_weights, aggregate_names = group_random_expert_gemm_tasks(
             distribution
@@ -817,7 +832,14 @@ def main() -> None:
         print(f"Fully tiled allowed loop orders: {', '.join(allowed)}")
     print(f"Output CSV: {csv_path}")
     print(f"Unique GEMM groups: {len(task_groups)}")
-    print(f"Router top-k implied by token routing: {ROUTER_TOP_K}")
+    print(f"Batch tokens: {BATCH_TOKENS}")
+    print(f"Router top-k: {ROUTER_TOP_K}")
+    print(f"Expert token split: {EVEN_SPLIT.summary()}")
+    if EVEN_SPLIT.ceil_tokens < TENSOR_CORE_MIN_BM:
+        print(
+            f"  per-expert GEMM M padded to {TENSOR_CORE_MIN_BM} "
+            f"(tensor core underutilized; real tokens/expert < {TENSOR_CORE_MIN_BM})"
+        )
     print(
         "Expert distribution model: "
         + (

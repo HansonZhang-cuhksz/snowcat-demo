@@ -1,17 +1,33 @@
 # Why the Snowcat Traffic Model Matters for Design Decisions
 
-All numbers: GLM-5.2 single layer, A100-like cores, 2.04 TB/s HBM @ 500 cycles, BF16,
-area grid step 0.001. Produced with the `--no-snowcat` mode of the analyzers
-(`snowcat_mode_comparison.md` has the mechanics); both models re-optimize the
-rc/rt/SMEM split unless stated otherwise.
+Setup: one GLM-5.2 layer on an A100-like chip (2.04 TB/s HBM @ 500 cycles, BF16, area
+grid step 0.001). "Snowcat" = Pareto-frontier traffic + per-tiling `num_stages` latency
+hiding; "no-snowcat" = algorithmic-minimum traffic + whole-SMEM streaming buffer
+(`--no-snowcat`; mechanics in `snowcat_mode_comparison.md`). Attention cores and
+vector/norm tasks are identical in both models. Both models re-optimize the rc/rt/SMEM
+split unless stated otherwise.
 
-**Claim.** Snowcat contributes exactly one term to the model: *HBM traffic as a function
-of SMEM capacity*. Deleting it (algorithmic-minimum traffic, SMEM-independent OI) leaves
-time predictions intact only while that term is off the critical path. The four facts
-below locate where it is on the critical path — and show the optimistic model mispricing
-time by up to 1.74× and silicon by up to +54% there.
+## The two roles of SMEM, and the one term the models disagree on
 
-## Fact 1 — GEMM traffic is a steep function of SMEM; no-snowcat deletes the entire curve
+| SMEM's role | snowcat | no-snowcat |
+|---|---|---|
+| **Latency hiding (pipelining)** | `C = num_stages` simultaneous copies of the tile working set: `BW_eff = min(bw, C·W/latency)`, `C·W ≤ SMEM` | streaming buffer: `BW_eff = min(bw, SMEM/latency)` |
+| **Traffic reduction (reuse)** | `traffic(W)`: Pareto frontier, decreasing in tile size, needs `W ≤ SMEM/C` | **absent** — traffic fixed at the algorithmic minimum |
+
+The pipelining term is implemented differently but measures **identical to within one
+tile** in both models (`C·W ≈ bw·latency` — Fact 4). Every divergence below is therefore
+the single deleted quantity — **traffic(SMEM)** — entering the critical path.
+
+| Where | Effect of deleting traffic(SMEM) |
+|---|---|
+| HBM traffic accounting, default chip | understated **4.7×** per prefill layer (2–20× per stage) |
+| Time, both models re-optimized, default chip | ≤ 1.3% (invisible) |
+| Time prediction for a fixed chip, bandwidth-starved (bw/64) | **1.74×** too fast |
+| Silicon allocation, bandwidth-starved (bw/64) | recommended chip **+53.7%** slower |
+| Silicon allocation, default chip (0.75 MiB SMEM recommendation) | **+20.0%** slower |
+| Silicon allocation, latency-starved (128× latency) | +0.3% (pipelining term dominates → models agree) |
+
+## Fact 1 — The deleted curve: traffic is steep in SMEM
 
 ![Traffic amplification vs SMEM](img/snowcat_frontier_amplification.png)
 
@@ -24,11 +40,11 @@ Traffic amplification (snowcat frontier ÷ algorithmic minimum) at given SMEM wo
 | prefill mla_q_b (M=1,048,576 × N=16384 × K=2048) | 8.0× | 4.4× | 1.9× | 1.3× | 1.1× | 1.0× |
 | decode up_gate (M=64 × N=4096 × K=6144) | 1.0× | 1.0× | 1.0× | 1.0× | 1.0× | 1.0× |
 
-Amplification reaches 800× at KB-scale SMEM and stays 2–5× even at the 8 MiB design
-point when all three GEMM dimensions are large. It is 1.0× at any SMEM ≥ 0.2 MiB for
-decode-shaped (small-M, weight-streaming) GEMMs — the one case where no-snowcat is exact.
+800× at KB-scale SMEM; 2–5× at the 8 MiB design point when all three GEMM dimensions
+are large; 1.0× above 0.2 MiB for decode-shaped (small-M, weight-streaming) GEMMs — the
+one shape class where the deleted term is genuinely zero.
 
-## Fact 2 — At the default design points the two models agree on time, but for two coincidental reasons
+## Fact 2 — Default design points: the term is off the critical path — times agree, traffic does not
 
 | Analyzer | snowcat time | no-snowcat time | Δtime | snowcat traffic | no-snowcat traffic | Δtraffic |
 |---|---:|---:|---:|---:|---:|---:|
@@ -38,24 +54,21 @@ decode-shaped (small-M, weight-streaming) GEMMs — the one case where no-snowca
 | Prefill (1M prompt, DSA) | 12,992.39 ms | 12,992.39 ms | 0.00% | **4,461,236 MiB** | **943,062 MiB** | **−79%** |
 | Inference (prefill + 150 decode) | 13,150.88 ms | 13,150.88 ms | 0.00% | — | — | — |
 
-- Decode/FFN: memory-bound, but their GEMMs are decode-shaped → snowcat traffic *is* the
-  algorithmic minimum (Fact 1, row 4) → identical times.
-- Prefill: snowcat traffic is 4.7× the minimum, but the layer is tensor-bound → the
-  amplification is hidden under compute → identical times, wildly different traffic:
+Two distinct reasons: decode/FFN GEMMs are decode-shaped, so snowcat traffic *is* the
+minimum (Fact 1, row 4); prefill carries 4.7× amplification but is tensor-bound, so the
+term hides under compute:
 
 ![Prefill stage traffic](img/snowcat_prefill_stage_traffic.png)
 
-Any traffic-derived quantity — DRAM energy, bandwidth headroom, multi-SM contention —
-is understated 2–20× per stage (4.7× per layer) by the optimistic model, even where the
-time agrees to the microsecond.
+Every traffic-derived quantity — DRAM energy, bandwidth headroom, multi-SM contention —
+is understated 2–20× per stage even where time agrees to the microsecond.
 
-## Fact 3 — When memory-bound and SMEM-starved, the models diverge on time *and* on the design
+## Fact 3 — Bandwidth scarcity puts the term on the critical path: the models diverge
 
-Prefill pushed into the memory-bound regime by scaling bandwidth (both models re-optimize
-the split at every point; "designed chip" = no-snowcat's recommended split evaluated
-under snowcat physics):
+Prefill, bandwidth scaled down; "designed chip" = no-snowcat's recommended split
+evaluated under snowcat physics:
 
-| HBM bw (TB/s) | snowcat optimum | no-snowcat optimum | no-snowcat-designed chip | design penalty | fixed-chip prediction error |
+| HBM bw (TB/s) | snowcat optimum | no-snowcat optimum | designed chip | design penalty | fixed-chip prediction error |
 |---:|---|---|---:|---:|---:|
 | 2.040 | 12,992 ms (8.1 MiB, rt 0.945) | 12,992 ms (8.1 MiB, rt 0.945) | 12,992 ms | +0.0% | 1.00× |
 | 1.020 | 13,130 ms (8.1 MiB) | 13,130 ms (8.1 MiB) | 13,130 ms | +0.0% | 1.00× |
@@ -67,45 +80,16 @@ under snowcat physics):
 
 ![Bandwidth sweep](img/snowcat_bw_sweep.png)
 
-- **Prediction error (same chip):** at bw/64, the 8 MiB chip really takes 64.3 s; the
-  optimistic model predicts 37.0 s — 1.74× under, approaching the traffic ratio.
-- **Design error (the structural failure):** snowcat responds to bandwidth scarcity by
-  trading cores for SMEM (8 → 24 → 48 MiB, rt 0.945 → 0.734). No-snowcat never moves —
-  in that model SMEM has zero marginal value beyond the bw·latency streaming buffer
-  (723 KB at the fixed 500-cycle latency of this sweep; see Fact 5 for the latency
-  axis) — and the chip it recommends is +54% slower than the snowcat-informed design.
-  The penalty grows monotonically with bandwidth scarcity; the same divergence appears
-  if tensor throughput rises instead of bandwidth falling (any compute:bandwidth ratio
-  ≳ 8× the A100-like baseline).
+Snowcat trades cores for SMEM (8 → 24 → 48 MiB, rt 0.945 → 0.734) because larger tiles
+cut traffic. No-snowcat's SMEM demand — max(bw·latency buffer, 8.39 MiB attention
+working set) — is bandwidth-insensitive (the buffer *shrinks* with bw), so its
+recommendation never moves along this axis and the gap grows without bound. The same
+divergence appears if tensor throughput rises instead of bandwidth falling
+(compute:bandwidth ratio ≳ 8× baseline).
 
-## Fact 4 — Snowcat is the only source of SMEM's *reuse* value in the area trade-off
+## Fact 4 — Latency scarcity stresses only the pipelining term, which both models share: they converge
 
-Best achievable time vs SMEM budget (rc/rt re-optimized at every point):
-
-![Time vs SMEM](img/snowcat_time_vs_smem.png)
-
-- Left (memory-bound FFN, default bw): the models diverge below ~2 MiB — no-snowcat
-  claims a 0.75 MiB chip matches a 2.3 MiB one (10.61 ms); snowcat shows +23% at
-  0.75 MiB (13.0 vs 10.6 ms) and the gap exploding below that. The optimistic model
-  renders the entire low-SMEM region of every area map falsely flat.
-- Right (memory-bound prefill, bw/16): no-snowcat's curve is *monotonically increasing*
-  — it prices SMEM as pure waste and pins the design at the 8 MiB attention-tile floor.
-  Snowcat's curve has a valley at 24.3 MiB (19.8 s); the no-snowcat design point really
-  costs 24.0 s (+21%). An SMEM↔cores trade-off worth 21–54% of performance is
-  *invisible in principle* to the algorithmic-minimum model.
-
-One further structural error: the no-snowcat fused-FFN minimum assumes the SwiGLU
-intermediate stays on chip regardless of size — 512 KB/expert at the decode default
-(plausible) but 128 MiB/expert at prefill scale (physically impossible at any split);
-snowcat's working-set feasibility check is what catches this class of fiction.
-
-## Fact 5 — SMEM demand has a second component: `num_stages` copies of the tile working set. It is mode-independent, so the models *converge* under latency scarcity
-
-In the snowcat latency model, SMEM holds `C = num_stages` simultaneous copies of the
-tile working set W (`C·W ≤ SMEM`, `BW_eff = min(bw, C·W/latency)`): higher latency
-demands more in-flight copies, and this pipelining footprint competes with using SMEM
-for reuse (larger W). HBM-latency sweep on the two memory-bound workloads (both models
-re-optimized per point; snowcat's winning up_gate tiling shown):
+FFN (batch 4096), latency scaled up; snowcat's winning up_gate tiling shown:
 
 | HBM latency (cyc) | bw·latency | snowcat optimum | no-snowcat optimum | up_gate tile W | C | C·W | design penalty | fixed-chip pred. error |
 |---:|---:|---|---|---:|---:|---:|---:|---:|
@@ -116,51 +100,60 @@ re-optimized per point; snowcat's winning up_gate tiling shown):
 | 32,000 | 44.15 MiB | 10.622 ms (45.51 MiB) | 10.622 ms (44.19 MiB) | 1,156 KiB | 40 | 45.16 MiB | +0.5% | 1.01× |
 | 64,000 | 88.31 MiB | 10.879 ms (87.06 MiB) | 10.860 ms (86.50 MiB) | 1,156 KiB | 77 | 86.93 MiB | +0.3% | 1.00× |
 
-(FFN, batch 4096. Decode layer, batch 2048/1M ctx: same SMEM trajectory 1.3 → 88 MiB
-in both models, times 1,224.5 → 1,233.0 ms, design penalty ≤ +0.1% at every latency —
-its dominant KV-stream/attention pipeline model is mode-identical.)
+(Decode layer, batch 2048/1M ctx: same SMEM trajectory 1.3 → 88 MiB in both models,
+times 1,224.5 → 1,233.0 ms, design penalty ≤ +0.1% everywhere — its dominant
+KV-stream/attention pipeline is mode-identical by construction.)
 
 ![Latency sweep](img/snowcat_latency_sweep.png)
 
-- **The flagged mechanism, confirmed directly:** snowcat hides latency by replicating
-  the *same* min-traffic 1,156 KiB tile — W never changes, `C` scales 1 → 77, and
-  `C·W` tracks bw·latency to within one tile. SMEM demand therefore decomposes into
-  **reuse (W, mode-dependent) + pipelining (C·W ≈ bw·latency, mode-independent)**.
-- **Both models' optimal SMEM scales with latency** (no-snowcat 0.75 → 86.5 MiB) — the
-  "no-snowcat SMEM never moves" behavior of Fact 3 is a fixed-latency artifact. For
-  *latency-driven* SMEM sizing, no-snowcat is accurate to O(one tile): bw·latency
-  dominates and is the same physics in both models.
-- **Latency scarcity makes the models converge; bandwidth scarcity makes them diverge**
-  (design penalty +20% → +0.3% as latency grows 128×, vs +0% → +54% as bandwidth falls
-  64× in Fact 3). Once bw·latency ≫ W, any SMEM that hides latency automatically fits
-  many copies of the min-traffic tile, so the reuse term is satisfied for free.
-- **The largest error is at the *default* 500-cycle point:** no-snowcat's 0.75 MiB pick
-  cannot fit the 1.13 MiB min-traffic tile, so under real physics the chip pays
-  amplified up_gate traffic — +20.0% on this memory-bound layer. The reuse term, not
-  the latency term, is what the optimistic model gets wrong.
-- Time itself is latency-insensitive in both models when SMEM is re-optimized
-  (10.613 → 10.879 ms across 128× latency): buying bw·latency of SMEM stays cheap
-  until it displaces half the cores (88 MiB = 46% of die at 64k cycles, rt 0.97 → 0.52).
+- Snowcat hides latency by replicating the *same* min-traffic tile: W stays 1,156 KiB,
+  `C` scales 1 → 77, `C·W` tracks bw·latency to within one tile — SMEM really holds
+  `num_stages` copies of the tile footprint.
+- Both models' optimal SMEM grows identically with latency (0.75 → 86.5 MiB): for
+  latency-driven SMEM sizing the models agree to O(one tile), because the pipelining
+  term is mode-independent.
+- Divergence *shrinks* as latency grows (+20.0% → +0.3%): once bw·latency ≫ W, any SMEM
+  that hides latency automatically fits the min-traffic tile, zeroing the deleted term.
+  The largest error is at the **default** 500-cycle point, where no-snowcat's 0.75 MiB
+  pick cannot fit the 1.13 MiB min-traffic tile.
+- Re-optimized time is latency-insensitive in both models (10.613 → 10.879 ms across
+  128×) until the bw·latency footprint displaces cores (87 MiB = 46% of die, rt 0.97 → 0.52).
+
+## Fact 5 — The SMEM axis: only snowcat sees the low-SMEM cliff and the scarce-bandwidth valley
+
+Best achievable time vs SMEM budget (rc/rt re-optimized at every point):
+
+![Time vs SMEM](img/snowcat_time_vs_smem.png)
+
+- Left (FFN, default bw): both curves rise below the ≈0.7 MiB bw·latency buffer (shared
+  pipelining term). Between 0.7 and ~2 MiB only snowcat rises — the deleted term: the
+  0.75 MiB chip that no-snowcat calls optimal (10.61 ms) really takes 12.73 ms
+  (**+20.0%**); 17.7 ms at 0.56 MiB (+67%); 58.9 ms at 0.19 MiB (5.5×).
+- Right (prefill, bw/16): no-snowcat's curve is monotonically increasing above the
+  8.39 MiB attention floor (its bw·latency buffer is 45 KB here), so it reads extra
+  SMEM as pure waste; snowcat's curve has a valley at 24.3 MiB (19.8 s) that the
+  no-snowcat design point misses at 24.0 s (+21%).
+
+Feasibility is part of the same deleted machinery: the no-snowcat fused-FFN minimum
+keeps the SwiGLU intermediate on chip regardless of size — 512 KB/expert at the decode
+default (plausible) but 128 MiB/expert at prefill scale (impossible at any split);
+snowcat's working-set check is what rejects such tilings.
 
 ## Conclusions
 
 | Question asked of the model | No-snowcat verdict | Requires snowcat? |
 |---|---|---|
 | Time, compute-bound workload (prefill @ 2 TB/s) | exact (0.00%) | no |
-| Time, memory-bound with weight-streaming GEMMs (decode, FFN, ≥ 2 MiB SMEM) | exact (≤0.08%) | no |
-| Time, memory-bound with large-operand GEMMs or SMEM below the min-traffic tile | **up to 1.74× under** | **yes** |
-| HBM traffic / DRAM energy / bandwidth headroom | **2–20× per stage under (4.7×/layer)** | **yes** |
-| SMEM for latency hiding (pipelining footprint `C·W ≈ bw·latency`) | accurate to O(one tile) at every latency (Fact 5) | no |
-| SMEM for data reuse (traffic reduction via tile size W) | **priced at zero — +20% design penalty even at the default 500-cycle point** | **yes** |
-| Core↔SMEM area allocation under bandwidth scarcity | **+10% to +54% silicon misallocation** | **yes** |
+| Time, memory-bound decode-shaped GEMMs, SMEM re-optimized ≥ min-traffic tile | exact to ≤0.2% at every latency tested | no |
+| SMEM for latency hiding (pipelining footprint `C·W ≈ bw·latency`) | accurate to O(one tile) at every latency (Fact 4) | no |
+| Time, memory-bound with large-operand GEMMs or SMEM below the min-traffic tile | **up to 1.74× under** (Facts 3, 5) | **yes** |
+| HBM traffic / DRAM energy / bandwidth headroom | **2–20× per stage under (4.7×/layer)** (Fact 2) | **yes** |
+| SMEM for traffic reduction (tile-size choice) | **term absent: +20% penalty at default, +54% at bw/64** (Facts 3–5) | **yes** |
+| On-chip feasibility of fusion working sets | unchecked (128 MiB/expert accepted) | **yes** |
 
-The algorithmic-minimum model is a valid *lower bound on traffic* and *upper bound on
-what better tiling could ever recover* (≤1.3% of time at the baseline design points),
-and — per Fact 5 — it prices SMEM's *pipelining* value (num_stages copies of the tile
-working set, ≈ bw·latency, mode-independent) correctly. What it deletes is SMEM's
-*reuse* value, the curve traffic(SMEM): every question that involves sizing SMEM for
-reuse, pricing bandwidth, or accounting for memory traffic gets its answer from that
-curve. The baseline agreement between the models is a property of this particular
-workload/chip ratio — not of the optimistic model — and it evaporates exactly where
-the design decisions become non-trivial: scarce bandwidth (diverging, up to +54%) and
-SMEM budgets near or below the min-traffic tile (+20% at the default operating point).
+One sentence: both models price SMEM's *pipelining* role (bw·latency, num_stages copies
+of the tile) the same, so removing snowcat is safe exactly where traffic(SMEM) is flat —
+decode-shaped GEMMs or compute-bound layers with SMEM above the min-traffic tile — and
+unsafe everywhere a design decision hinges on the traffic(SMEM) curve it deletes: SMEM
+sizing near or below the min-traffic tile (+20% at the default chip), core↔SMEM
+allocation under bandwidth scarcity (up to +54%), and any traffic/energy accounting (4.7×).

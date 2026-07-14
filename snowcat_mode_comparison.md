@@ -70,6 +70,15 @@ streaming buffer `BW_eff = min(bw, SMEM/latency)`. Saturating `bw = 2.04 TB/s` a
 all and collapse to the grid minimum (0.188 MiB). The freed area buys ~3–10 extra tensor
 cores — worth ≤0.4% in time.
 
+Two caveats (measured in `snowcat_importance_report.md`, Facts 4–5): the bw·latency
+pipelining footprint is not Snowcat-specific — under Snowcat it appears as
+`num_stages` simultaneous copies of the tile working set (`C·W ≈ bw·latency`), so both
+models' SMEM demand grows identically with latency (0.75 → 86.5 MiB at 500 → 64,000
+cycles). And the smaller no-snowcat recommendation is not free: at 0.752 MiB the
+Snowcat-modeled FFN runs +20% slower (12.73 vs 10.61 ms) because the 1.13 MiB
+min-traffic up_gate tile no longer fits — the mode difference shows up in the *design*,
+not in the re-optimized time.
+
 **Exception — prefill (and therefore inference/batched) is bit-identical in both modes**: its
 optimum is pinned at 8.086 MiB not by Snowcat but by the flash-attention working set
 (`ATTN_FLASH_BLOCK = 128` rows × 64 heads × 512 × 2 B = 8.39 MiB per pipeline stage, one stage
@@ -116,8 +125,9 @@ decode stays bandwidth-bound and split-indifferent, prefill stays tensor-bound a
 combined design (same 858-tensor/326-CUDA split, pinned by the 8 MiB flash-attention tile),
 and end-to-end inference time is identical to the digit. What Snowcat actually contributes at
 these optima is not time but **fidelity of the memory-system picture**: the honest SMEM
-requirement (a few MiB rather than a 723 KB streaming buffer) and the real HBM traffic, which
-the algorithmic-minimum model understates by up to 4.7× (prefill) — the gap a real chip would
-pay in DRAM energy and bandwidth headroom. Use `--no-snowcat` as an optimistic lower bound on
+requirement (enough for the min-traffic tile *times* the `num_stages ≈ bw·latency/W`
+in-flight copies, rather than a bare bw·latency streaming buffer) and the real HBM traffic,
+which the algorithmic-minimum model understates by up to 4.7× (prefill) — the gap a real
+chip would pay in DRAM energy and bandwidth headroom. Use `--no-snowcat` as an optimistic lower bound on
 traffic and an upper bound on how much any smarter tiling could ever help: for these
 workloads, at most 1.3% of time.

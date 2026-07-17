@@ -35,11 +35,6 @@ PROMPT_SEQ_LEN = 1_048_576      # prefill prompt length (GLM-5.2 max context)
 DECODE_TOKENS = 1_048_576            # number of tokens generated autoregressively
 DECODE_BATCH = 1              # decode batch = concurrent sequences
 
-# True (default) runs both stage models with the Snowcat/Orojenesis traffic
-# frontier.  False propagates no-snowcat mode to both stages: algorithmic-minimum
-# GEMM traffic (OI independent of SMEM) and BW_eff = min(bw, SMEM/latency).
-USE_SNOWCAT = True
-
 
 def _fmt_split(res: dict, i: int) -> str:
     return (
@@ -52,8 +47,6 @@ def _fmt_split(res: dict, i: int) -> str:
 def evaluate_inference() -> dict:
     """Evaluate prefill + N-token decode over the shared area grid.  Returns per-node
     arrays and the combined-best index."""
-    pf.USE_SNOWCAT = USE_SNOWCAT
-    dc.USE_SNOWCAT = USE_SNOWCAT
     pf.configure(1, PROMPT_SEQ_LEN)
     dc.configure(DECODE_BATCH, PROMPT_SEQ_LEN)
 
@@ -137,11 +130,6 @@ def main(write_outputs: bool = True) -> dict:
           f"KV context grows {PROMPT_SEQ_LEN:,} -> {PROMPT_SEQ_LEN + DECODE_TOKENS - 1:,}")
     print(f"Prefill attention: {'DSA top-' + str(pf.DSA_INDEX_TOPK) if pf.DSA_ENABLED else 'dense'}; "
           f"decode attention: dense absorbed MLA over the KV cache")
-    print("Traffic model: "
-          + ("Snowcat Pareto frontier"
-             if USE_SNOWCAT
-             else "NO SNOWCAT -- algorithmic-minimum HBM traffic "
-             "(OI independent of SMEM; BW_eff = min(bw, SMEM/latency))"))
 
     print("\n=== Combined-Optimal Area Split (single chip for both stages) ===")
     print(f"  {_fmt_split(p, i)}")
@@ -166,10 +154,8 @@ def main(write_outputs: bool = True) -> dict:
               f"{100 * (c - combined_best) / combined_best:+.2f}% vs best")
 
     if write_outputs:
-        suffix = "" if USE_SNOWCAT else "_no_snowcat"
-        plot_path = f"./result/inference_area_latency{suffix}_combined_time.png"
-        plot_combined(res, plot_path)
-        print(f"\nWrote {plot_path}")
+        plot_combined(res, "./result/inference_area_latency_combined_time.png")
+        print("\nWrote ./result/inference_area_latency_combined_time.png")
 
     return res
 
@@ -186,12 +172,6 @@ def _parse_args(argv: list[str] | None = None):
     parser.add_argument("--seq-len", type=int, default=PROMPT_SEQ_LEN,
                         help=f"prompt length for prefill (default {PROMPT_SEQ_LEN}).")
     parser.add_argument("--no-write", action="store_true", help="skip the PNG output.")
-    parser.add_argument(
-        "--no-snowcat",
-        action="store_true",
-        help="disable the Snowcat traffic frontier in both stage models "
-        "(algorithmic-minimum GEMM traffic; overly optimistic).",
-    )
     return parser.parse_args(argv)
 
 
@@ -199,6 +179,4 @@ if __name__ == "__main__":
     args = _parse_args()
     DECODE_TOKENS = args.decode_tokens
     PROMPT_SEQ_LEN = args.seq_len
-    if args.no_snowcat:
-        USE_SNOWCAT = False
     main(write_outputs=not args.no_write)

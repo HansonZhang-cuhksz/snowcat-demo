@@ -30,11 +30,6 @@ BATCH_N = 1                    # concurrent sessions (prefills, and decode batch
 PROMPT_SEQ_LEN = 1_048_576     # prompt length per session
 DECODE_TOKENS = 150            # output tokens generated per session
 
-# True (default) runs both stage models with the Snowcat/Orojenesis traffic
-# frontier.  False propagates no-snowcat mode to both stages: algorithmic-minimum
-# GEMM traffic (OI independent of SMEM) and BW_eff = min(bw, SMEM/latency).
-USE_SNOWCAT = True
-
 
 def _fmt_split(res: dict, i: int) -> str:
     return (
@@ -46,8 +41,6 @@ def _fmt_split(res: dict, i: int) -> str:
 
 def evaluate_batched(batch_n: int, decode_tokens: int, seq_len: int) -> dict:
     """Evaluate N prefills + N-batched decode over the shared area grid."""
-    pf.USE_SNOWCAT = USE_SNOWCAT
-    dc.USE_SNOWCAT = USE_SNOWCAT
     pf.configure(1, seq_len)            # single-sequence prefill (run N times)
     dc.configure(batch_n, seq_len)      # N-batched decode
 
@@ -88,9 +81,6 @@ def _report(res: dict) -> None:
     total = float(res["combined"][i])
     print(f"\n=== Batched inference: N={n} sessions, {PROMPT_SEQ_LEN:,}-token prompts, "
           f"{DECODE_TOKENS} output tokens ===")
-    if not USE_SNOWCAT:
-        print("Traffic model: NO SNOWCAT -- algorithmic-minimum HBM traffic "
-              "(OI independent of SMEM; BW_eff = min(bw, SMEM/latency))")
     print(f"Combined-optimal split: {_fmt_split(p, i)}")
     print(f"  {n} prefills : {pf_t * 1e3:12.1f} ms  ({100 * pf_t / total:5.1f}%)")
     print(f"  decode x{DECODE_TOKENS} (batch {n}): {dc_t * 1e3:12.1f} ms  ({100 * dc_t / total:5.1f}%)")
@@ -101,8 +91,7 @@ def _report(res: dict) -> None:
 
 def sweep(batches: list[int]) -> None:
     print(f"Prompt {PROMPT_SEQ_LEN:,} tokens, {DECODE_TOKENS} output tokens/session; "
-          f"prefill DSA, decode dense."
-          + ("" if USE_SNOWCAT else "  [NO SNOWCAT: algorithmic-min traffic]") + "\n")
+          f"prefill DSA, decode dense.\n")
     hdr = (f"{'N':>5} | {'total ms':>11} | {'prefill%':>8} {'decode%':>8} | {'rt':>5} "
            f"{'CUDA':>4} {'TENS':>5} {'SMEM MiB':>8} | {'Ktok/s':>8} | {'ms/session':>10}")
     print(hdr)
@@ -131,10 +120,6 @@ def _parse_args(argv: list[str] | None = None):
     parser.add_argument("--seq-len", type=int, default=PROMPT_SEQ_LEN)
     parser.add_argument("--sweep", type=lambda s: [int(x) for x in s.split(",")],
                         default=None, help="comma-separated batch sizes to sweep.")
-    parser.add_argument(
-        "--no-snowcat", action="store_true",
-        help="disable the Snowcat traffic frontier in both stage models "
-        "(algorithmic-minimum GEMM traffic; overly optimistic).")
     return parser.parse_args(argv)
 
 
@@ -143,8 +128,6 @@ if __name__ == "__main__":
     BATCH_N = args.batch
     DECODE_TOKENS = args.decode_tokens
     PROMPT_SEQ_LEN = args.seq_len
-    if args.no_snowcat:
-        USE_SNOWCAT = False
     if args.sweep:
         sweep(args.sweep)
     else:

@@ -84,16 +84,6 @@ EXPERT_DISTRIBUTION_PROBABILITY_CUTOFF = 1e-12
 HBM_LATENCY_CYCLES = 500
 HBM_CLOCK_HZ = 1215 * 10**6
 
-# True (default) estimates each stage's HBM traffic with the fused/standard
-# Snowcat-style Pareto frontiers (traffic depends on the SMEM-resident tiling)
-# and hides HBM latency with the per-tiling num_stages above.  False removes
-# Snowcat: every stage moves only its algorithmic-minimum HBM traffic (operands
-# read once, results written once; the up_gate/SwiGLU output is consumed on chip
-# by the down GEMM without touching HBM), so OI is independent of the SMEM
-# capacity, and latency hiding treats the whole SMEM as one ideal streaming
-# buffer: BW_eff = min(bw, SMEM_total / latency).  Overly optimistic.
-USE_SNOWCAT = True
-
 @dataclass(frozen=True)
 class ReductionTask:
     name: str
@@ -421,8 +411,6 @@ def output_paths() -> tuple[str, str]:
         suffix_parts.append("register_accumulator")
     if USE_RANDOM_EXPERT_DISTRIBUTION:
         suffix_parts.append("random_experts")
-    if not USE_SNOWCAT:
-        suffix_parts.append("no_snowcat")
     suffix = "" if not suffix_parts else "_" + "_".join(suffix_parts)
 
     return (
@@ -439,53 +427,7 @@ def tensor_core_tile_allowed(bm: int, bn: int, bk: int) -> bool:
     )
 
 
-def algorithmic_min_fused_frontier(stage: FusedGemmStage) -> FusedTrafficFrontier:
-    """Single-point frontier with the algorithmic-minimum HBM traffic for
-    USE_SNOWCAT=False.  ``router_rms_scale`` reads its input and weights and writes
-    the score matrix.  ``up_gate_rms_swiglu`` reads its input and weights only: the
-    SwiGLU output is consumed on chip by the down GEMM (see
-    ``algorithmic_min_standard_frontier``), so the intermediate activations never
-    touch HBM.  With a 1-byte working set the latency model reduces to
-    ``BW_eff = min(bw, SMEM_total / latency)`` (whole-SMEM streaming buffer) and
-    the point is valid at any SMEM capacity."""
-    b = BYTE_PER_ELEMENT
-    if stage.name.startswith("up_gate"):
-        traffic = (stage.m * stage.k + stage.k * stage.n) * b
-    else:
-        traffic = (stage.m * stage.k + stage.k * stage.n + stage.m * stage.n) * b
-    return FusedTrafficFrontier(
-        stage=stage,
-        buffer_bytes=np.array([1], dtype=np.int64),
-        traffic_bytes=np.array([traffic], dtype=np.int64),
-        bm=np.array([stage.m], dtype=np.int64),
-        bn=np.array([stage.n], dtype=np.int64),
-        bk=np.array([stage.k], dtype=np.int64),
-        loop_orders=(("m", "n", "k"),),
-    )
-
-
-def algorithmic_min_standard_frontier(
-    stage: StandardGemmStage,
-) -> StandardTrafficFrontier:
-    """Algorithmic minimum for the down GEMM with USE_SNOWCAT=False: its input
-    activations arrive on chip from the fused up_gate/SwiGLU stage, so it only
-    reads its weights and writes its output."""
-    b = BYTE_PER_ELEMENT
-    traffic = (stage.k * stage.n + stage.m * stage.n) * b
-    return StandardTrafficFrontier(
-        stage=stage,
-        buffer_bytes=np.array([1], dtype=np.int64),
-        traffic_bytes=np.array([traffic], dtype=np.int64),
-        bm=np.array([stage.m], dtype=np.int64),
-        bn=np.array([stage.n], dtype=np.int64),
-        bk=np.array([stage.k], dtype=np.int64),
-        loop_orders=(("m", "n", "k"),),
-    )
-
-
 def build_fused_frontier(stage: FusedGemmStage) -> FusedTrafficFrontier:
-    if not USE_SNOWCAT:
-        return algorithmic_min_fused_frontier(stage)
     points = [
         point
         for point in stage.traffic_points_fn()
@@ -557,8 +499,6 @@ def build_fused_frontier(stage: FusedGemmStage) -> FusedTrafficFrontier:
 
 
 def build_standard_frontier(stage: StandardGemmStage) -> StandardTrafficFrontier:
-    if not USE_SNOWCAT:
-        return algorithmic_min_standard_frontier(stage)
     workload = GemmWorkload(
         m=stage.m,
         k=stage.k,
@@ -774,14 +714,6 @@ def format_selected_mapping(
     mapping = select_mapping_from_frontier(frontier, s_total, tensor_roof, cuda_roof)
     if mapping is None:
         return "no mapping fits selected SMEM capacity"
-    if not USE_SNOWCAT:
-        return (
-            "algorithmic-min traffic (Snowcat disabled): "
-            f"traffic={mapping['traffic'] / 2**20:.3f} MiB, "
-            f"OI={mapping['oi']:.6f} FLOP/byte, "
-            f"BW_eff={mapping['bw_eff'] / 1e12:.6f} TB/s "
-            "(whole-SMEM streaming buffer)"
-        )
     return (
         f"BM={mapping['bm']}, BN={mapping['bn']}, BK={mapping['bk']}, "
         f"loop_order={'-'.join(mapping['loop_order'])}, "
@@ -1117,18 +1049,12 @@ def main() -> None:
     print(
         "Fused traffic model: "
         + (
-            (
-                "register-accumulator loop orders only"
-                if USE_REGISTER_ACCUMULATOR_MAPPINGS
-                else "original fused all-loop-order mapspace"
-            )
-            if USE_SNOWCAT
-            else "NO SNOWCAT -- algorithmic-minimum HBM traffic "
-            "(operands + results only; fused intermediates stay on chip; "
-            "OI independent of SMEM; BW_eff = min(bw, SMEM/latency))"
+            "register-accumulator loop orders only"
+            if USE_REGISTER_ACCUMULATOR_MAPPINGS
+            else "original fused all-loop-order mapspace"
         )
     )
-    if USE_SNOWCAT and USE_REGISTER_ACCUMULATOR_MAPPINGS:
+    if USE_REGISTER_ACCUMULATOR_MAPPINGS:
         allowed = ["-".join(loop_order) for loop_order in REGISTER_ACCUMULATOR_LOOP_ORDERS]
         print(f"Fused allowed loop orders: {', '.join(allowed)}")
     print(f"Output CSV: {csv_path}")
@@ -1234,25 +1160,5 @@ def main() -> None:
     print(f"residual_add HBM traffic: {RESIDUAL_ADD_TASK.traffic_bytes / 2**20:.3f} MiB")
 
 
-def _parse_args(argv: list[str] | None = None):
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Fused MoE decode-FFN die-area / latency estimator "
-        "(fused Snowcat-style traffic frontiers + num_stages latency hiding)."
-    )
-    parser.add_argument(
-        "--no-snowcat",
-        action="store_true",
-        help="disable the Snowcat traffic frontiers; use algorithmic-minimum HBM "
-        "traffic per stage (fused intermediates on chip) and "
-        "BW_eff = min(bw, SMEM/latency) (overly optimistic).",
-    )
-    return parser.parse_args(argv)
-
-
 if __name__ == "__main__":
-    args = _parse_args()
-    if args.no_snowcat:
-        USE_SNOWCAT = False
     main()

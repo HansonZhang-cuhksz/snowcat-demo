@@ -141,17 +141,6 @@ EXPERT_DISTRIBUTION_PROBABILITY_CUTOFF = 1e-12
 HBM_LATENCY_CYCLES = 500
 HBM_CLOCK_HZ = 1215 * 10**6
 
-# True (default) estimates each GEMM's HBM traffic with the Snowcat/Orojenesis
-# Pareto frontier (traffic depends on the SMEM-resident tiling) and hides HBM
-# latency with the per-tiling num_stages above.  False removes Snowcat: every GEMM
-# moves only its algorithmic-minimum HBM traffic (read A and B once, write C once),
-# so GEMM OI is independent of the SMEM capacity, and latency hiding treats the
-# whole SMEM as one ideal streaming buffer: BW_eff = min(bw, SMEM_total / latency).
-# Overly optimistic (assumes perfect on-chip reuse of every operand).  The MLA
-# attention core and vector/norm tasks already use analytic operand/result traffic
-# and are identical in both modes.
-USE_SNOWCAT = True
-
 
 @dataclass(frozen=True)
 class GemmTask:
@@ -561,33 +550,7 @@ def tensor_core_tile_allowed(bm: int, bn: int, bk: int) -> bool:
     )
 
 
-def algorithmic_min_frontier(group: GemmTaskGroup) -> TrafficFrontier:
-    """Single-point frontier carrying the algorithmic-minimum HBM traffic (operands
-    read once, result written once) for USE_SNOWCAT=False.  With a 1-byte working
-    set the latency model in ``gemm_time_from_frontier`` reduces to
-    ``BW_eff = min(bw, SMEM_total / latency)`` -- the whole SMEM acts as one ideal
-    streaming buffer -- and the point is valid at any SMEM capacity, so traffic
-    (and hence OI) no longer depends on the SMEM budget."""
-    task = group.task
-    traffic = BYTE_PER_ELEMENT * (
-        task.m * task.k + task.k * task.n + task.m * task.n
-    )
-    return TrafficFrontier(
-        label=group.label,
-        count=group.count,
-        operations=task.operations,
-        buffer_bytes=np.array([1], dtype=np.int64),
-        traffic_bytes=np.array([traffic], dtype=np.int64),
-        bm=np.array([task.m], dtype=np.int64),
-        bn=np.array([task.n], dtype=np.int64),
-        bk=np.array([task.k], dtype=np.int64),
-        loop_orders=(("m", "n", "k"),),
-    )
-
-
 def build_traffic_frontier(group: GemmTaskGroup) -> TrafficFrontier:
-    if not USE_SNOWCAT:
-        return algorithmic_min_frontier(group)
     task = group.task
     workload = GemmWorkload(
         m=task.m,
@@ -682,8 +645,6 @@ def output_paths() -> tuple[str, str, str]:
         suffix_parts.append("register_accumulator")
     if USE_RANDOM_EXPERT_DISTRIBUTION:
         suffix_parts.append("random_experts")
-    if not USE_SNOWCAT:
-        suffix_parts.append("no_snowcat")
     suffix = "" if not suffix_parts else "_" + "_".join(suffix_parts)
 
     return (
@@ -786,14 +747,6 @@ def format_selected_mapping(
     mapping = select_mapping_from_frontier(frontier, s_total, tensor_roof)
     if mapping is None:
         return "no mapping fits selected SMEM capacity"
-    if not USE_SNOWCAT:
-        return (
-            "algorithmic-min traffic (Snowcat disabled): "
-            f"traffic={mapping['traffic'] / 2**20:.3f} MiB, "
-            f"OI={mapping['oi']:.6f} FLOP/byte, "
-            f"BW_eff={mapping['bw_eff'] / 1e12:.6f} TB/s "
-            "(whole-SMEM streaming buffer)"
-        )
     return (
         f"BM={mapping['bm']}, BN={mapping['bn']}, BK={mapping['bk']}, "
         f"loop_order={'-'.join(mapping['loop_order'])}, "
@@ -1377,18 +1330,12 @@ def main(write_outputs: bool = True) -> dict[str, object]:
     print(
         "Traffic model: "
         + (
-            (
-                "register-accumulator loop orders only"
-                if USE_REGISTER_ACCUMULATOR_MAPPINGS
-                else "original Snowcat all-loop-order mapspace"
-            )
-            if USE_SNOWCAT
-            else "NO SNOWCAT -- algorithmic-minimum HBM traffic "
-            "(operands + results only; OI independent of SMEM; "
-            "BW_eff = min(bw, SMEM/latency))"
+            "register-accumulator loop orders only"
+            if USE_REGISTER_ACCUMULATOR_MAPPINGS
+            else "original Snowcat all-loop-order mapspace"
         )
     )
-    if USE_SNOWCAT and USE_REGISTER_ACCUMULATOR_MAPPINGS:
+    if USE_REGISTER_ACCUMULATOR_MAPPINGS:
         allowed = [
             "-".join(loop_order)
             for loop_order in FULLY_TILED_REGISTER_ACCUMULATOR_LOOP_ORDERS
@@ -1581,18 +1528,10 @@ def _parse_args(argv: list[str] | None = None):
         action="store_true",
         help="skip the (large) CSV and PNG outputs; print the report only.",
     )
-    parser.add_argument(
-        "--no-snowcat",
-        action="store_true",
-        help="disable the Snowcat traffic frontier; use algorithmic-minimum HBM "
-        "traffic per GEMM and BW_eff = min(bw, SMEM/latency) (overly optimistic).",
-    )
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    if args.no_snowcat:
-        USE_SNOWCAT = False
     configure(args.batch_tokens, args.seq_len)
     main(write_outputs=not args.no_write)

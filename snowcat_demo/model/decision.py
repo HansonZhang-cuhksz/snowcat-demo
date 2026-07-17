@@ -1,7 +1,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
+
+try:  # Python >= 3.11
+    from enum import StrEnum
+except ImportError:  # Python < 3.11 (e.g. the 3.10 'fusion' conda env) -- compat shim
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        """Backport of enum.StrEnum for Python < 3.11 (compatibility only).
+
+        Faithful for the usage here (explicit string member values): str comparison,
+        ``.value``, ``str()`` and ``format()`` all match the 3.11+ StrEnum. No-op on
+        3.11+, where the real StrEnum is imported instead.
+        """
+
+        __str__ = str.__str__
+        __format__ = str.__format__
+
+        @staticmethod
+        def _generate_next_value_(name, start, count, last_values):
+            return name.lower()
 
 from .mapping import MappingPoint
 from .pareto import best_at_capacity
